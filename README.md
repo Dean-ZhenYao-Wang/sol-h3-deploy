@@ -72,12 +72,22 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 | `hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors` | HyperFlow LoRA | ModelScope `videorebirth/hyperflow` |
 | `sol-h3-vae/` | fast-VAE 权重 + code | ModelScope `Efficient-Large-Model/Sol-H3-VAE` |
 
+> **警告**：`hf upload` 的第三个参数是「仓库内的目标路径」，**必须是目录名**。写成 `.` 会把本地目录内容平铺到仓库根目录——两个 DiT 目录文件名完全相同（config.json / 14 个分片 / adaln_table.pt），第二次上传会全部覆盖第一次。
+
 上传预构建权重到 HuggingFace（40G，数小时，建议 tmux 内执行防断线）：
 
 ```bash
 hf auth login                  # token: https://huggingface.co/settings/tokens（Write 权限）
-hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 .
-hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 .
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 transformer_hf8
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 transformer_ref_hf8
+```
+
+上传前建议把本地备份文件移出待传目录（避免混入仓库）：
+
+```bash
+mkdir -p /root/hyperflow/table-backups
+mv /root/hyperflow/transformer_hf8/*.bak-audio /root/hyperflow/table-backups/ 2>/dev/null
+mv /root/hyperflow/transformer_ref_hf8/*.bak-audio /root/hyperflow/table-backups/ 2>/dev/null
 ```
 
 使用者下载预构建权重（配合 `setup.sh --skip-build`）：
