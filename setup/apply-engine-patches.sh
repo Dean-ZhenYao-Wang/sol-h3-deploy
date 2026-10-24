@@ -36,6 +36,8 @@ fi
 
 PY="${SOL_H3_PY:-/root/h3_runtime_venv/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3 || echo python3)"
+# 补丁是相对这个上游 commit 生成的（上游把引擎放在 sol-engine 分支上）
+TESTED_UPSTREAM="41866cd"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 shopt -s nullglob
 PATCHES=("$PATCH_DIR"/*.patch)
@@ -86,7 +88,8 @@ for patch_file in "${PATCHES[@]}"; do
     done
   else
     echo "!! 补丁不适用: $name"
-    echo "   目标文件与上游不一致（上游可能已更新）。两条出路："
+    echo "   目标文件与上游不一致（上游可能已更新）。补丁基准是上游 commit $TESTED_UPSTREAM。"
+    echo "   两条出路："
     echo "   1) 直接用本仓库 engine/Sol-H3-ComfyUI 覆盖 $ENGINE"
     echo "   2) 手工把改动并进去（备份在 $ENGINE/*.bak-$STAMP）"
     exit 1

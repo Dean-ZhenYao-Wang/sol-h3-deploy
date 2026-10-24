@@ -10,6 +10,10 @@
 | `0001-sol-h3-engine-extensions.patch` | 本仓库全部引擎改动（相对上游 commit，路径相对引擎目录） |
 | `orig/hyperflow_worker.py.orig` | 上游原始 `hyperflow_worker.py`（对照 / 回退用） |
 
+> **上游分支**：Sol-H3 引擎在 NVlabs/Sana 的 **`sol-engine`** 分支上，`main` 分支里没有它
+> （不指定分支克隆会得到一个 83MB 的空仓库，**看起来成功其实没有引擎**）。
+> 本补丁相对上游 commit **`41866cd`**（sol-engine 分支尖端）生成。
+
 ## 用法
 
 ```bash
