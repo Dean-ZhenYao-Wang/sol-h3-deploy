@@ -175,5 +175,66 @@ class StudioGallery(unittest.TestCase):
             self.assertEqual(comfy_routes.list_gallery(None), {"items": []})
 
 
+class StudioReferences(unittest.TestCase):
+    """Native IMAGE / AUDIO sockets: a wired reference becomes a file the engine can read."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        path = Path(self.temp.name) / "config.json"
+        path.write_text(json.dumps({"profiles": {
+            "FP8": {"precision": "fp8", "label": "Fast", "python": "x", "paths": "y"}}}))
+        self.env = patch.dict(os.environ, {"SOL_ENGINE_CONFIG": str(path)})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_image_batch_becomes_png_files_in_order(self):
+        import numpy as np
+        from PIL import Image
+        batch = np.zeros((2, 8, 6, 3), dtype="float32")
+        batch[0] = 1.0
+        batch[1, 0, 0, :] = 0.5
+        paths = comfy_nodes.materialize_images(batch)
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(Image.open(paths[0]).size, (6, 8))
+        self.assertEqual(Image.open(paths[0]).getpixel((0, 0)), (255, 255, 255))
+        self.assertEqual(Image.open(paths[1]).getpixel((0, 0)), (128, 128, 128))
+
+    def test_audio_becomes_a_readable_wav(self):
+        import numpy as np
+        import wave
+        waveform = np.zeros((1, 2, 800), dtype="float32")
+        waveform[0, 0, :400] = 0.5
+        paths = comfy_nodes.materialize_audio({"waveform": waveform, "sample_rate": 16000})
+        self.assertEqual(len(paths), 1)
+        with wave.open(paths[0]) as handle:
+            self.assertEqual(handle.getframerate(), 16000)
+            self.assertEqual(handle.getnchannels(), 2)
+            self.assertEqual(handle.getnframes(), 800)
+
+    def test_extend_refuses_wired_references(self):
+        import numpy as np
+        node = comfy_nodes.SolH3Extend()
+        with self.assertRaisesRegex(ValueError, "text conditioning only"):
+            node.generate("FP8", "a scene", 1, session="x",
+                          image_input=np.zeros((1, 4, 4, 3), dtype="float32"))
+        with self.assertRaisesRegex(ValueError, "text conditioning only"):
+            node.generate("FP8", "a scene", 1, session="x",
+                          audio_1={"waveform": np.zeros((1, 1, 4), dtype="float32"), "sample_rate": 16000})
+
+    def test_image_rules_use_the_resolved_count(self):
+        node = comfy_nodes.SolH3Generate()
+        with self.assertRaisesRegex(ValueError, "does not support reference-image mode"):
+            node.generate("FP8", "a scene", 1, mode="reference")
+        with self.assertRaisesRegex(ValueError, "Upload an image for reference-image mode"):
+            comfy_nodes.check_images("reference", 0)
+        with self.assertRaisesRegex(ValueError, "exactly one image"):
+            comfy_nodes.check_images("first_frame", 2)
+        self.assertIsNone(comfy_nodes.check_images("reference", 1))
+        self.assertIsNone(comfy_nodes.check_images("text", 0))
+
+
 if __name__ == "__main__":
     unittest.main()

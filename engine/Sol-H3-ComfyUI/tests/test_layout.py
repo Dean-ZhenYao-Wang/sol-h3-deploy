@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("custom_sol_h3", root / "__init__.
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-assert set(module.NODE_CLASS_MAPPINGS) == {"SolH3Generate", "SolH3Release"}
+assert set(module.NODE_CLASS_MAPPINGS) == {"SolH3Generate", "SolH3Release", "SolH3Extend"}
 assert (root / module.WEB_DIRECTORY / "timing.js").is_file()
 from custom_sol_h3.sol_h3_engine import config, bridge
 assert config.config_path() == root / "config.json"

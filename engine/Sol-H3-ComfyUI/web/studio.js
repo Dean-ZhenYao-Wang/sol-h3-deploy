@@ -525,6 +525,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
 
         // ---- State.
         let promptId = null, settled = false, running = false, submitting = false, last = null, tick = null;
+        // A reference wired in the node graph counts as an image source as well.
+        const linked = name => Boolean(node.inputs?.find(entry => entry.name === name)?.link);
         function blocked() {
             if (running || submitting) return t('Generating…', '生成中…');
             if (!prompt.value.trim()) return t('Describe your scene to start.', '先描述你的画面。');
@@ -532,7 +534,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             if (!p || /SOL_ENGINE_CONFIG/.test(p.name)) return t('Configure a Sol-H3 profile first (config.json).', '请先配置 Sol-H3 profile（config.json）。');
             if (mode !== 'text' && mode !== 'extend' && !p.modes.includes(mode))
                 return t(`Switch pipeline to use ${MODE_NAME[mode]()}.`, `切换流程以使用${MODE_NAME[mode]()}模式。`);
-            if (mode !== 'text' && mode !== 'extend' && !images.length) return mode === 'first_frame'
+            if (mode !== 'text' && mode !== 'extend' && !images.length && !linked('image_input')) return mode === 'first_frame'
                 ? t('Upload a first-frame image.', '请上传首帧图片。') : t('Upload at least one reference image.', '请至少上传一张参考图。');
             return '';
         }

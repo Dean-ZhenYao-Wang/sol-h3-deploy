@@ -102,7 +102,9 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | keep_loaded | 布尔 | True | True=跑完保留模型（下条免加载，**推荐**）；False=每次重新加载 |
 | mode | 下拉 | text | text / first_frame / reference |
 | image | 文本 | 空 | 图片文件名，逗号分隔（reference ≤9，顺序=编号；first_frame 恰好 1 张） |
+| **image_input** | **图片口 (IMAGE)** | — | **连线用**：接 `LoadImage`（单张）或 `ImageBatch`（多张，**批次顺序=编号顺序**），≤9 张 |
 | audio | 文本 | 空 | 音频文件名，逗号分隔（仅 reference，≤3，顺序=编号） |
+| **audio_1 / audio_2 / audio_3** | **音频口 (AUDIO)** | — | **连线用**：接 `LoadAudio`，三个独立口对应音1/音2/音3，≤3 段 |
 | backend | 下拉 | local | 保持 local |
 | resolution | 下拉 | 768p | 768p（66s）/ 480p（22s） |
 | output_dir | 文本 | 空 | 保存目录（相对 ComfyUI 输出目录）。空 = `SolH3/<mode>` |
@@ -120,6 +122,7 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | session | 文本 | 空 | **接上一条 Generate 或 Extend 节点的 session 输出口（第三个输出）**，或直接粘 `.session.safetensors` 文件路径 |
 | window_frames | 整数 | 39 | 上一条尾部钉入上下文的帧数。推荐 39 或 90（共享音视频网格）；56/22/5 合法；范围 5–124 |
 | keep_loaded / resolution | — | 同 Generate | — |
+| **image_input / audio_1…3** | **图片/音频口** | — | **不支持**：引擎规定续接请求只走文本条件，接了会立刻报错（见下） |
 | output_dir | 文本 | 空 | 保存目录（相对 ComfyUI 输出目录）。空 = `SolH3/extend` |
 | filename | 文本 | 空 | 保存文件名（不含扩展名）。空 = `solh3_extend_<时间>_s<seed>` |
 
@@ -128,6 +131,23 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 #### 3. SolH3Release —— 释放节点
 
 输入 `after`（VIDEO，接在链尾任何 VIDEO 输出后面）：VIDEO 原样透传，同时**关闭引擎进程**释放内存/显存。跑完长链后想彻底释放时接在末端。
+
+### 节点图里怎么给参考图 / 参考音频
+
+参考素材有**两种给法**，可以混用：
+
+| 素材 | 连线（推荐） | 文本框（Studio 用的那种） |
+|---|---|---|
+| 参考图 | `LoadImage` → `image_input`；多张用 `ImageBatch` 串起来，**批次顺序就是编号顺序**（图1、图2…），≤9 张 | `image` 填 input 目录里的文件名，逗号分隔 |
+| 参考音频 | `LoadAudio` → `audio_1` / `audio_2` / `audio_3`（三个独立口，对应音1/音2/音3），≤3 段 | `audio` 填文件名，逗号分隔 |
+
+要点：
+
+- 节点内部把线上的素材**落成真实文件**（`input/solh3_refs/<随机>/ref_01.png`、`audio.wav`）再交给引擎——引擎读的是文件路径，所以画质、音色都不打折
+- 混用时编号顺序 = **连线的在前、文本框的在后**
+- 模式决定这些口是否生效：`image_input` 只在 **first-frame / reference** 模式用；`audio_*` 只在 **reference** 模式用
+- Studio 里也认节点图上连进来的图（算作已提供参考图），但 Studio 自己的上传区仍是日常入口
+- **Extend 节点不支持参考素材**：引擎规定续接请求只走文本条件（`An extend request carries text conditioning only`）。把参考图/参考音频放在**链条的第一条 Generate** 上，后面的 Extend 靠潜空间上下文保持画面连续。给 Extend 连了参考素材会在跑之前就报错并告诉你该放哪儿
 
 ### 标准连线图（文本版）
 
@@ -241,3 +261,4 @@ pkill -f "main.py"; sleep 3; bash /root/launch_comfy.sh
 5. **AdaLN 表音频扩展行**：transformer_hf8 与 transformer_ref_hf8 的 adaln_table.pt 各 +8 个音频参考变体行（p0f_light.py 生成）
 6. **保存位置可控**：comfy_nodes.py 的 `output_dir` / `filename`（Generate 与 Extend 都有）——成片移到可读路径，默认名 `solh3_<模式>_<时间>_s<种子>`
 7. **Studio 续接来源选择器**：web/studio.js + `GET /solh3/sessions`——Studio 可选任意历史片段续接（与节点图端口接法对齐）
+8. **原生参考素材口**：comfy_nodes.py 的 `image_input`(IMAGE) / `audio_1…3`(AUDIO)——节点图可直接拉 `LoadImage` / `LoadAudio` 接线，节点内部落文件再交引擎

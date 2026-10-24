@@ -2,7 +2,9 @@
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
+import uuid
 
 from . import bridge
 from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
@@ -41,7 +43,77 @@ def resolve_images(image):
     return paths
 
 
-def check_request(profile, mode, image, backend, resolution="768p"):
+def reference_folder():
+    """A scratch folder for materialised references: ComfyUI's input dir, or a temp dir off ComfyUI."""
+    try:
+        import folder_paths
+        base = Path(folder_paths.get_input_directory())
+    except Exception:
+        base = Path(tempfile.gettempdir())
+    folder = base / "solh3_refs"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def materialize_images(image_input):
+    """A connected IMAGE batch -> PNG files; the batch order is the reference order."""
+    if image_input is None:
+        return []
+    import numpy as np
+    from PIL import Image as PILImage
+    tensor = image_input
+    if isinstance(tensor, (list, tuple)):
+        tensor = tensor[0]
+    if tensor is None:
+        return []
+    if hasattr(tensor, "detach"):
+        tensor = tensor.detach().to("cpu")
+    frames = (np.asarray(tensor, dtype="float32") * 255.0).round().astype("uint8")
+    if frames.ndim == 3:
+        frames = frames[None]
+    folder = reference_folder() / uuid.uuid4().hex[:8]
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index, frame in enumerate(frames):
+        target = folder / ("ref_%02d.png" % (index + 1))
+        PILImage.fromarray(frame).save(target)
+        paths.append(str(target))
+    return paths
+
+
+def materialize_audio(audio_input):
+    """A connected AUDIO -> a WAV file (the engine reads it back with PyAV)."""
+    if not audio_input:
+        return []
+    import numpy as np
+    import wave
+    waveform = audio_input.get("waveform")
+    if waveform is None:
+        return []
+    if hasattr(waveform, "detach"):
+        waveform = waveform.detach().to("cpu")
+    rate = int(audio_input.get("sample_rate") or 32000)
+    data = np.asarray(waveform, dtype="float32")
+    if data.ndim == 3:
+        data = data[0]
+    if data.ndim == 1:
+        data = data[None]
+    channels = int(data.shape[0])
+    interleaved = data.T.reshape(-1)
+    pcm = (np.clip(interleaved, -1.0, 1.0) * 32767.0).astype("<i2")
+    folder = reference_folder() / uuid.uuid4().hex[:8]
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / "audio.wav"
+    with wave.open(str(target), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(pcm.tobytes())
+    return [str(target)]
+
+
+def check_request(profile, mode, backend, resolution="768p"):
+    """Profile, mode and resolution rules; the image count is checked once known."""
     if backend not in BACKENDS:
         raise ValueError("Unknown backend: %s" % backend)
     if mode not in MODES:
@@ -51,13 +123,19 @@ def check_request(profile, mode, image, backend, resolution="768p"):
     if resolution not in profile_resolutions(profile):
         raise ValueError("This pipeline renders %s only" % ", ".join(profile_resolutions(profile)))
     effective = mode
-    if effective != "text":
-        if effective not in profile_modes(profile):
-            raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[effective])
-        if not image.strip():
-            raise ValueError("Upload an image for %s mode" % MODE_LABELS[effective])
-        if effective == "first_frame" and len([n for n in image.split(",") if n.strip()]) != 1:
-            raise ValueError("First-frame mode takes exactly one image")
+    if effective != "text" and effective not in profile_modes(profile):
+        raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[effective])
+
+
+def check_images(mode, count):
+    """The image rules that need the resolved image count."""
+    if mode == "text":
+        return
+    if not count:
+        raise ValueError("Upload an image for %s mode (or connect an image node)"
+                         % MODE_LABELS[mode])
+    if mode == "first_frame" and count != 1:
+        raise ValueError("First-frame mode takes exactly one image")
 
 
 def latest_session(output_root):
@@ -155,7 +233,11 @@ class SolH3Generate:
             # Optional with defaults so workflows saved before Studio still load.
             "mode": (GENERATE_MODES, {"default": "text"}),
             "image": ("STRING", {"default": ""}),
+            "image_input": ("IMAGE", {"tooltip": "Connect LoadImage (or ImageBatch for up to 9 references). Batch order = reference order. First-frame / reference mode only."}),
             "audio": ("STRING", {"default": ""}),
+            "audio_1": ("AUDIO", {"tooltip": "Connect LoadAudio: reference audio 1 of up to 3. Reference mode only."}),
+            "audio_2": ("AUDIO", {"tooltip": "Reference audio 2 of up to 3. Reference mode only."}),
+            "audio_3": ("AUDIO", {"tooltip": "Reference audio 3 of up to 3. Reference mode only."}),
             "backend": (BACKENDS, {"default": "local"}),
             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
             # New widgets sit last so workflows saved earlier keep their mapping.
@@ -175,17 +257,36 @@ class SolH3Generate:
         return float("nan")
 
     def generate(self, profile, prompt, seed, keep_loaded=True, mode="text", image="", audio="",
-                 backend="local", resolution="768p", output_dir="", filename="", unique_id=None):
+                 backend="local", resolution="768p", output_dir="", filename="",
+                 image_input=None, audio_1=None, audio_2=None, audio_3=None, unique_id=None):
         if not prompt.strip():
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("Seed must be a nonnegative 63-bit integer")
-        check_request(profile, mode, image or "", backend, resolution)
+        check_request(profile, mode, backend, resolution)
+        # Image rules that do not need the resolved count run before the ComfyUI
+        # imports, so a bad request fails fast (and the CPU tests stay hostless).
+        if mode != "text":
+            named = len([n for n in (image or "").split(",") if n.strip()])
+            wired = 1 if image_input is not None else 0
+            if not named and not wired:
+                raise ValueError("Upload an image for %s mode (or connect an image node)"
+                                 % MODE_LABELS[mode])
+            if mode == "first_frame" and named + wired != 1:
+                raise ValueError("First-frame mode takes exactly one image")
         import folder_paths
         import comfy.model_management as mm
         from comfy_api.latest import InputImpl
-        images = resolve_images(image or "") if mode != "text" else []
-        audios = resolve_images(audio) if (mode == "reference" and audio.strip()) else []
+        # Connected sockets first, then the filename fields (the Studio writes those).
+        images = materialize_images(image_input) if mode != "text" else []
+        if mode != "text":
+            images += resolve_images(image or "")
+        audios = []
+        for slot in (audio_1, audio_2, audio_3):
+            audios += materialize_audio(slot)
+        if mode == "reference" and audio.strip():
+            audios += resolve_images(audio)
+        check_images(mode, len(images))
         if audios and mode != "reference":
             raise ValueError("Audio references need reference mode")
         if len(audios) > 3:
@@ -273,6 +374,12 @@ class SolH3Extend:
             "keep_loaded": ("BOOLEAN", {"default": True}),
         }, "optional": {
             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
+            # The engine continues a take with text conditioning only; the sockets
+            # exist so the node graph shows that limit instead of hiding it.
+            "image_input": ("IMAGE", {"tooltip": "Not supported on Extend: an extend request carries text conditioning only. Put reference images on the first Generate of the chain."}),
+            "audio_1": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
+            "audio_2": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
+            "audio_3": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
             # New widgets sit last so workflows saved earlier keep their mapping.
             "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/extend."}),
             "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_extend_<time>_s<seed>."}),
@@ -290,18 +397,23 @@ class SolH3Extend:
         return float("nan")
 
     def generate(self, profile, prompt, seed, session, window_frames=39, keep_loaded=True,
-                 resolution="768p", output_dir="", filename="", unique_id=None):
+                 resolution="768p", output_dir="", filename="",
+                 image_input=None, audio_1=None, audio_2=None, audio_3=None, unique_id=None):
         if not prompt.strip():
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("Seed must be a nonnegative 63-bit integer")
+        if image_input is not None or any(slot is not None for slot in (audio_1, audio_2, audio_3)):
+            raise ValueError("Extend continues a take with text conditioning only: the engine "
+                             "refuses reference images or audio on an extend request. Put the "
+                             "references on the first Generate of the chain instead.")
         import folder_paths
         output_root = folder_paths.get_output_directory()
         # Empty session => continue the newest take (Studio auto-continue / node convenience).
         session = (session or "").strip() or latest_session(output_root)
         if not 5 <= int(window_frames) <= 124:
             raise ValueError("window_frames must be between 5 and 124")
-        check_request(profile, "text", "", "local", resolution)
+        check_request(profile, "text", "local", resolution)
         from comfy_api.latest import InputImpl
         import comfy.model_management as mm
         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()

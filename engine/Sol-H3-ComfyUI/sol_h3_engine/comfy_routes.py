@@ -5,6 +5,7 @@ from pathlib import Path
 
 LIBRARY = Path("SolH3") / "library"
 MATCH_WINDOW_S = 600  # SaveVideo writes its MP4 shortly after the node's sidecar.
+DEDUPE_WINDOW_S = 30  # A SaveVideo copy of the same take lands within seconds of it.
 
 
 def _sidecars(output_root):
@@ -38,11 +39,12 @@ def list_videos(output_root, limit=24, history=None):
     videos.sort()
     known = {path for _, path in videos}
 
-    items, claimed, windows = [], set(), []
+    items, claimed, windows, duplicates = [], set(), [], []
     for record in records:
         created = record.get("created")
         if isinstance(created, (int, float)):
             windows.append((created - 2, created + MATCH_WINDOW_S))
+            duplicates.append((created - DEDUPE_WINDOW_S, created + DEDUPE_WINDOW_S))
         path = None
         saved = record.get("output_path")
         if saved:
@@ -73,8 +75,10 @@ def list_videos(output_root, limit=24, history=None):
                       "created": record.get("created", path.stat().st_mtime)})
 
     # MP4s no take claims: show them unless a take already explains that moment.
+    # A SaveVideo copy of a take lands seconds after it, so only a short window
+    # counts as "the same take" -- a wider one would swallow unrelated clips.
     for mtime, path in videos:
-        if path in claimed or any(a <= mtime <= b for a, b in windows):
+        if path in claimed or any(a <= mtime <= b for a, b in duplicates):
             continue
         relative = path.relative_to(root)
         items.append({"id": relative.as_posix(), "file": path.name,
