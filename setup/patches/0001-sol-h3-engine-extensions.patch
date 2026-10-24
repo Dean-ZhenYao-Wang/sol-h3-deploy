@@ -1,0 +1,2294 @@
+diff --git a/scripts/hyperflow/convert_ref.py b/scripts/hyperflow/convert_ref.py
+index 7833448..59f325b 100644
+--- a/scripts/hyperflow/convert_ref.py
++++ b/scripts/hyperflow/convert_ref.py
+@@ -26,7 +26,7 @@ from safetensors.torch import save_file
+ TARGETS = (".attn.to_q.weight", ".attn.to_k.weight", ".attn.to_v.weight", ".attn.to_out.0.weight",
+            ".ff.net.0.proj.weight", ".ff.net.2.weight")
+ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+-AHEAD = 2
++AHEAD = 1
+ 
+ 
+ def fetch(url, path):
+diff --git a/sol_h3_engine/bridge.py b/sol_h3_engine/bridge.py
+index 3788913..7ffa741 100644
+--- a/sol_h3_engine/bridge.py
++++ b/sol_h3_engine/bridge.py
+@@ -40,8 +40,8 @@ class EngineProcess:
+             self.log.close()
+             raise
+ 
+-    def generate(self, prompt, seed, decoder="original", cancel=None, mode="text", images=(),
+-                 progress=None, resolution="768p"):
++    def generate(self, prompt, seed, decoder="original", cancel=None, mode="text", images=(), audios=(),
++                 progress=None, resolution="768p", extend=None):
+         self.sequence += 1
+         response = self.root / ("response-%05d.json" % self.sequence)
+         # A worker MAY write stage/step updates here; absence is normal.
+@@ -49,8 +49,11 @@ class EngineProcess:
+         command = {"op": "generate", "prompt": prompt, "seed": seed,
+                    "decoder": decoder, "response": str(response),
+                    "case_id": "request-%05d" % self.sequence,
+-                   "mode": mode, "images": [str(path) for path in images], "resolution": resolution,
++                   "mode": mode, "images": [str(path) for path in images],
++                   "audios": [str(path) for path in audios], "resolution": resolution,
+                    "progress": str(progress_file)}
++        if extend:
++            command["extend"] = dict(extend)
+         started = time.monotonic()
+         reported = 0.0
+         try:
+@@ -117,7 +120,7 @@ _key = None
+ 
+ 
+ def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode="text",
+-             images=(), progress=None, resolution="768p"):
++             images=(), audios=(), progress=None, resolution="768p", extend=None):
+     global _engine, _key
+     # One resident model session. Switching precision/decoder releases the old one.
+     decoder = decoder or profile.get("decoder", "original")
+@@ -131,7 +134,8 @@ def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode
+             _key = key
+         try:
+             return _engine.generate(prompt, seed, decoder, cancel, mode=mode, images=images,
+-                                    progress=progress, resolution=resolution)
++                                    audios=audios, progress=progress, resolution=resolution,
++                                    extend=extend)
+         except BaseException:
+             _engine = None
+             _key = None
+diff --git a/sol_h3_engine/comfy_nodes.py b/sol_h3_engine/comfy_nodes.py
+index e1b29ae..5162213 100644
+--- a/sol_h3_engine/comfy_nodes.py
++++ b/sol_h3_engine/comfy_nodes.py
+@@ -2,13 +2,17 @@
+ import json
+ import os
+ from pathlib import Path
++import tempfile
+ import time
++import uuid
+ 
+ from . import bridge
++from . import extend as _extend
+ from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
+ 
+-MODES = ["text", "first_frame", "reference"]
+-MODE_LABELS = {"first_frame": "first-frame", "reference": "reference-image"}
++MODES = ["text", "first_frame", "reference", "extend"]
++GENERATE_MODES = ["text", "first_frame", "reference"]
++MODE_LABELS = {"text": "text", "first_frame": "first-frame", "reference": "reference-image", "extend": "extend"}
+ BACKENDS = ["local"]
+ # Latest update per node for GET /solh3/progress (polling fallback for reloads).
+ PROGRESS = {}
+@@ -40,7 +44,185 @@ def resolve_images(image):
+     return paths
+ 
+ 
+-def check_request(profile, mode, image, backend, resolution="768p"):
++def reference_root():
++    """Where materialised references live: ComfyUI's input dir, or a temp dir off ComfyUI."""
++    try:
++        import folder_paths
++        base = Path(folder_paths.get_input_directory())
++    except Exception:
++        base = Path(tempfile.gettempdir())
++    return base / "solh3_refs"
++
++
++def reference_folder():
++    """A scratch folder for materialised references: ComfyUI's input dir, or a temp dir off ComfyUI."""
++    folder = reference_root()
++    folder.mkdir(parents=True, exist_ok=True)
++    return folder
++
++
++def scratch_copies(paths):
++    """The temporary copies this node made under solh3_refs/ (the user's own files never match)."""
++    try:
++        base = reference_root().resolve()
++    except OSError:
++        return []
++    folders = []
++    for path in paths:
++        parent = Path(path).resolve().parent
++        if parent.parent == base and parent not in folders:
++            folders.append(parent)
++    return folders
++
++
++def drop_scratch_copies(paths):
++    """Remove the temporary copies: the engine froze them into the take by now."""
++    import shutil
++    for folder in scratch_copies(paths):
++        shutil.rmtree(folder, ignore_errors=True)
++
++
++def materialize_images(image_input):
++    """A connected IMAGE batch -> PNG files; the batch order is the reference order."""
++    if image_input is None:
++        return []
++    import numpy as np
++    from PIL import Image as PILImage
++    tensor = image_input
++    if isinstance(tensor, (list, tuple)):
++        tensor = tensor[0]
++    if tensor is None:
++        return []
++    if hasattr(tensor, "detach"):
++        tensor = tensor.detach().to("cpu")
++    frames = (np.asarray(tensor, dtype="float32") * 255.0).round().astype("uint8")
++    if frames.ndim == 3:
++        frames = frames[None]
++    folder = reference_folder() / uuid.uuid4().hex[:8]
++    folder.mkdir(parents=True, exist_ok=True)
++    paths = []
++    for index, frame in enumerate(frames):
++        target = folder / ("ref_%02d.png" % (index + 1))
++        PILImage.fromarray(frame).save(target)
++        paths.append(str(target))
++    return paths
++
++
++def materialize_audio(audio_input):
++    """A connected AUDIO -> a WAV file (the engine reads it back with PyAV)."""
++    if not audio_input:
++        return []
++    import numpy as np
++    import wave
++    waveform = audio_input.get("waveform")
++    if waveform is None:
++        return []
++    if hasattr(waveform, "detach"):
++        waveform = waveform.detach().to("cpu")
++    rate = int(audio_input.get("sample_rate") or 32000)
++    data = np.asarray(waveform, dtype="float32")
++    if data.ndim == 3:
++        data = data[0]
++    if data.ndim == 1:
++        data = data[None]
++    channels = int(data.shape[0])
++    interleaved = data.T.reshape(-1)
++    pcm = (np.clip(interleaved, -1.0, 1.0) * 32767.0).astype("<i2")
++    folder = reference_folder() / uuid.uuid4().hex[:8]
++    folder.mkdir(parents=True, exist_ok=True)
++    target = folder / "audio.wav"
++    with wave.open(str(target), "wb") as handle:
++        handle.setnchannels(channels)
++        handle.setsampwidth(2)
++        handle.setframerate(rate)
++        handle.writeframes(pcm.tobytes())
++    return [str(target)]
++
++
++def collect_references(mode, image, audio, image_input=None, audio_slots=()):
++    """A take's reference images and audio.
++
++    Connected sockets first, then the file-name fields. The mode decides what
++    counts: a text take has no references, first-frame takes one image, and
++    reference takes up to nine images and three audio clips -- the engine needs an
++    image to go with audio.
++    """
++    if mode == "text":
++        return [], []
++    images = materialize_images(image_input)
++    if (image or "").strip():
++        images += resolve_images(image)
++    audios = []
++    if mode == "reference":
++        for slot in audio_slots:
++            audios += materialize_audio(slot)
++        if (audio or "").strip():
++            audios += resolve_images(audio)
++        if audios and not images:
++            raise ValueError("Audio references need a reference image (official constraint)")
++        if len(audios) > 3:
++            raise ValueError("At most 3 audio references")
++    if len(images) > 9:
++        raise ValueError("At most 9 reference images")
++    return images, audios
++
++
++def read_session_references(session_path):
++    """The reference records a take stored in its session sidecar."""
++    from safetensors import safe_open
++    path = Path(session_path or "")
++    if not path.is_file():
++        return []
++    try:
++        with safe_open(str(path), framework="pt") as handle:
++            raw = (handle.metadata() or {}).get("references")
++    except Exception:
++        return []
++    if not raw:
++        return []
++    try:
++        records = json.loads(raw)
++    except ValueError:
++        return []
++    if not isinstance(records, list):
++        return []
++    return [record for record in records if isinstance(record, dict)]
++
++
++def inherited_references(session_path):
++    """The parent take's stored conditioning: the copies it froze for itself.
++
++    obvpm's model: a chain inherits the conditioning of the take it continues,
++    and that conditioning is an artifact, not a recipe. The take froze its
++    reference media into its own directory, so a later take picks up the very
++    same files -- after a restart, after the source file moved on, after the
++    input folder was cleared. A missing artifact is refused by name: a chain
++    never silently rebuilds its conditioning.
++    """
++    images, audios = [], []
++    for record in read_session_references(session_path):
++        path = str(record.get("path") or "")
++        kind = str(record.get("kind") or "image")
++        if not path or not os.path.isfile(path):
++            raise ValueError(
++                "The take this extends stored its conditioning at %s, and that file is gone. "
++                "A chain never rebuilds its conditioning silently: restore the file, or "
++                "attach the reference again to continue with a new one."
++                % (path or "an unnamed file"))
++        expected = str(record.get("sha256") or "")
++        digest = _extend.file_digest(path)
++        if expected and digest != expected:
++            raise ValueError(
++                "The take this extends stored its conditioning at %s, and that file has "
++                "changed since (digest %s, was %s). Restore it, or attach the reference "
++                "again to continue with a new one."
++                % (path, digest[:12], expected[:12]))
++        (images if kind == "image" else audios).append(path)
++    return images, audios
++
++
++def check_request(profile, mode, backend, resolution="768p"):
++    """Profile, mode and resolution rules; the image count is checked once known."""
+     if backend not in BACKENDS:
+         raise ValueError("Unknown backend: %s" % backend)
+     if mode not in MODES:
+@@ -49,20 +231,90 @@ def check_request(profile, mode, image, backend, resolution="768p"):
+         raise ValueError("Unknown resolution: %s" % resolution)
+     if resolution not in profile_resolutions(profile):
+         raise ValueError("This pipeline renders %s only" % ", ".join(profile_resolutions(profile)))
+-    if mode != "text":
+-        if mode not in profile_modes(profile):
+-            raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[mode])
+-        if not image.strip():
+-            raise ValueError("Upload an image for %s mode" % MODE_LABELS[mode])
+-        if mode == "first_frame" and len([n for n in image.split(",") if n.strip()]) != 1:
+-            raise ValueError("First-frame mode takes exactly one image")
++    effective = mode
++    if effective != "text" and effective not in profile_modes(profile):
++        raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[effective])
++
++
++def check_images(mode, count):
++    """The image rules that need the resolved image count."""
++    if mode == "text":
++        return
++    if not count:
++        raise ValueError("Upload an image for %s mode (or connect an image node)"
++                         % MODE_LABELS[mode])
++    if mode == "first_frame" and count != 1:
++        raise ValueError("First-frame mode takes exactly one image")
++
++
++def latest_session(output_root):
++    """Newest Sol-H3 session sidecar across all output sessions (Studio auto-continue)."""
++    import glob as _glob
++    found = _glob.glob(str(Path(output_root) / "sol_h3" / "*" / "request-*" / "session.session.safetensors"))
++    if not found:
++        raise ValueError("No take to continue yet: generate a video first (any mode), then Extend")
++    return max(found, key=os.path.getmtime)
++
++
++def safe_stem(name):
++    """A file stem that stays on one path segment (no separators, no traversal)."""
++    stem = str(name or "").strip().replace("\\", "/").split("/")[-1]
++    stem = stem.replace("\x00", "").strip()
++    if stem in (".", ".."):
++        return ""
++    return stem
++
++
++def resolve_output_dir(output_root, output_dir, mode):
++    """Where a take is saved: a folder under the ComfyUI output root."""
++    root = Path(output_root).resolve()
++    raw = str(output_dir or "").strip().replace("\\", "/").strip("/")
++    if not raw:
++        raw = "SolH3/%s" % mode
++    if ".." in raw.split("/"):
++        raise ValueError("output_dir must stay inside the ComfyUI output folder")
++    folder = (root / raw).resolve()
++    try:
++        folder.relative_to(root)
++    except ValueError:
++        raise ValueError("output_dir must stay inside the ComfyUI output folder") from None
++    return folder
++
++
++def default_stem(mode, seed):
++    """A readable default: solh3_<mode>_<time>_s<seed>."""
++    return "solh3_%s_%s_s%d" % (mode, time.strftime("%Y%m%d-%H%M%S"), seed)
++
++
++def place_take(output_root, result, output_dir, filename, mode, seed):
++    """Move the engine MP4 to a human-readable path and return that path.
++
++    The engine writes into an opaque work folder (sol_h3/<uuid>/request-NNNNN), so
++    the take is moved out to <output_dir>/<name>.mp4 and the output tree reads
++    SolH3/<mode>/solh3_<mode>_<time>_s<seed>.mp4 unless the caller names it.
++    """
++    source = Path(result["output"])
++    folder = resolve_output_dir(output_root, output_dir, mode)
++    folder.mkdir(parents=True, exist_ok=True)
++    stem = safe_stem(filename) or default_stem(mode, seed)
++    target = folder / (stem + ".mp4")
++    index = 1
++    while target.exists():
++        target = folder / ("%s_%d.mp4" % (stem, index))
++        index += 1
++    os.replace(str(source), str(target))
++    result["engine_output"] = str(source)
++    result["output"] = str(target)
++    return target
+ 
+ 
+ def write_sidecar(output_root, prompt_id, result, mode, seed, resolution="768p"):
+-    """Library record; SaveVideo writes the MP4, so the record lives beside the library."""
++    """Library record; the take itself lives at the readable path."""
+     folder = Path(output_root) / "SolH3" / "library"
+     folder.mkdir(parents=True, exist_ok=True)
+-    record = {"id": prompt_id, "engine_output": result.get("output"),
++    record = {"id": prompt_id, "engine_output": result.get("engine_output") or result.get("output"),
++              "output_path": result.get("output"),
++              "delivered_output": result.get("delivered_output"), "session": result.get("session"),
+               "prompt": result.get("prompt"), "mode": mode, "profile": result.get("profile"),
+               "seed": seed, "resolution": resolution, "e2e_s": result.get("e2e_s"), "created": time.time()}
+     temporary = folder / (prompt_id + ".tmp")
+@@ -88,14 +340,22 @@ class SolH3Generate:
+             "keep_loaded": ("BOOLEAN", {"default": True}),
+         }, "optional": {
+             # Optional with defaults so workflows saved before Studio still load.
+-            "mode": (MODES, {"default": "text"}),
++            "mode": (GENERATE_MODES, {"default": "text"}),
+             "image": ("STRING", {"default": ""}),
++            "image_input": ("IMAGE", {"tooltip": "Connect LoadImage (or ImageBatch for up to 9 references). Batch order = reference order. First-frame / reference mode only."}),
++            "audio": ("STRING", {"default": ""}),
++            "audio_1": ("AUDIO", {"tooltip": "Connect LoadAudio: reference audio 1 of up to 3. Reference mode only."}),
++            "audio_2": ("AUDIO", {"tooltip": "Reference audio 2 of up to 3. Reference mode only."}),
++            "audio_3": ("AUDIO", {"tooltip": "Reference audio 3 of up to 3. Reference mode only."}),
+             "backend": (BACKENDS, {"default": "local"}),
+             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
++            # New widgets sit last so workflows saved earlier keep their mapping.
++            "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/<mode>."}),
++            "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_<mode>_<time>_s<seed>."}),
+         }, "hidden": {"unique_id": "UNIQUE_ID"}}
+ 
+-    RETURN_TYPES = ("VIDEO", "STRING")
+-    RETURN_NAMES = ("video_with_audio", "timing_json")
++    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
++    RETURN_NAMES = ("video_with_audio", "timing_json", "session")
+     FUNCTION = "generate"
+     CATEGORY = "Sol Engine"
+     OUTPUT_NODE = True
+@@ -105,17 +365,32 @@ class SolH3Generate:
+         # Every queued request must run: never time a ComfyUI cache hit.
+         return float("nan")
+ 
+-    def generate(self, profile, prompt, seed, keep_loaded=True, mode="text", image="",
+-                 backend="local", resolution="768p", unique_id=None):
++    def generate(self, profile, prompt, seed, keep_loaded=True, mode="text", image="", audio="",
++                 backend="local", resolution="768p", output_dir="", filename="",
++                 image_input=None, audio_1=None, audio_2=None, audio_3=None, unique_id=None):
+         if not prompt.strip():
+             raise ValueError("Enter a nonempty prompt")
+         if type(seed) is not int or not 0 <= seed < 2**63:
+             raise ValueError("Seed must be a nonnegative 63-bit integer")
+-        check_request(profile, mode, image or "", backend, resolution)
++        check_request(profile, mode, backend, resolution)
++        # Image rules that do not need the resolved count run before the ComfyUI
++        # imports, so a bad request fails fast (and the CPU tests stay hostless).
++        if mode != "text":
++            named = len([n for n in (image or "").split(",") if n.strip()])
++            wired = 1 if image_input is not None else 0
++            if not named and not wired:
++                raise ValueError("Upload an image for %s mode (or connect an image node)"
++                                 % MODE_LABELS[mode])
++            if mode == "first_frame" and named + wired != 1:
++                raise ValueError("First-frame mode takes exactly one image")
+         import folder_paths
+         import comfy.model_management as mm
+         from comfy_api.latest import InputImpl
+-        images = resolve_images(image or "") if mode != "text" else []
++        # Connected sockets first, then the filename fields (the Studio writes those).
++        images, audios = collect_references(mode, image, audio, image_input,
++                                            (audio_1, audio_2, audio_3))
++        check_images(mode, len(images))
++        extend = None
+         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
+         publish(node, prompt_id, "queued", started)
+         output_root = folder_paths.get_output_directory()
+@@ -137,11 +412,14 @@ class SolH3Generate:
+             try:
+                 result = bridge.generate(settings, output_root, prompt, seed,
+                                          cancel=mm.throw_exception_if_processing_interrupted,
+-                                         mode=mode, images=images, progress=progress, resolution=resolution)
++                                         mode=mode, images=images, audios=audios, extend=extend,
++                                         progress=progress, resolution=resolution)
+             finally:
++                drop_scratch_copies(images + audios)
+                 if not keep_loaded:
+                     bridge.close()
+             publish(node, prompt_id, "saving", started, steps=steps)
++            place_take(output_root, result, output_dir, filename, mode, seed)
+             if prompt_id:
+                 write_sidecar(output_root, prompt_id, result, mode, seed, resolution)
+         except BaseException as error:
+@@ -155,8 +433,10 @@ class SolH3Generate:
+         # Lets Studio show the engine MP4 at once (and in graphs without SaveVideo).
+         relative = Path(result["output"]).resolve().relative_to(Path(output_root).resolve())
+         video = {"filename": relative.name, "subfolder": relative.parent.as_posix(), "type": "output"}
++        # The session sidecar carries this take's latents for the next extend.
++        session = result.get("session") or ""
+         return {"ui": {"text": [report], "solh3_video": [video]},
+-                "result": (InputImpl.VideoFromFile(result["output"]), report)}
++                "result": (InputImpl.VideoFromFile(result["output"]), report, session)}
+ 
+ 
+ class SolH3Release:
+@@ -178,6 +458,121 @@ class SolH3Release:
+         return (after,)
+ 
+ 
+-NODE_CLASS_MAPPINGS = {"SolH3Generate": SolH3Generate, "SolH3Release": SolH3Release}
++class SolH3Extend:
++    """Continue a previous take: its tail window rides as pinned context and the
++    engine generates the next segment after it (masked extend). Wire the previous
++    take's session output in; chain the output's session again to keep going."""
++
++    @classmethod
++    def INPUT_TYPES(cls):
++        return {"required": {
++            "profile": (profile_names(),),
++            "prompt": ("STRING", {"multiline": True, "default": "The woman keeps walking, slows down and turns her head toward a cat sitting under an awning, then smiles. overall_soundscape: rain continues, a cat meows softly."}),
++            "seed": ("INT", {"default": 43, "min": 0, "max": 2**53 - 1}),
++            "session": ("STRING", {"default": "", "tooltip": "The previous take's session sidecar: the session output of a Generate/Extend node, or the .session.safetensors path."}),
++            "window_frames": ("INT", {"default": 39, "min": 5, "max": 124, "tooltip": "Frames of the previous take's tail pinned as context. From a 124-frame take the legal lengths are 39/90 (shared AV grid, recommended), 56, 22, 5; the engine refuses the rest."}),
++            "keep_loaded": ("BOOLEAN", {"default": True}),
++        }, "optional": {
++            "resolution": (list(RESOLUTIONS), {"default": "768p"}),
++            # Reference files, for the Studio path; the sockets below take the same
++            # material in the node graph. Both may be used at once.
++            "image": ("STRING", {"default": "", "tooltip": "Reference image file names, comma separated (the new take's own references)."}),
++            "audio": ("STRING", {"default": "", "tooltip": "Reference audio file names, comma separated."}),
++            # A wired reference turns this into a ref2va extend: the new take carries
++            # its own images and audio while the pinned window keeps the seam.
++            "image_input": ("IMAGE", {"tooltip": "Connect LoadImage (or ImageBatch): the new take's own reference images. Empty = continue with text conditioning only."}),
++            "audio_1": ("AUDIO", {"tooltip": "Connect LoadAudio: the new take's reference audio 1 of up to 3. Needs a reference image."}),
++            "audio_2": ("AUDIO", {"tooltip": "Reference audio 2 of up to 3. Needs a reference image."}),
++            "audio_3": ("AUDIO", {"tooltip": "Reference audio 3 of up to 3. Needs a reference image."}),
++            # New widgets sit last so workflows saved earlier keep their mapping.
++            "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/extend."}),
++            "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_extend_<time>_s<seed>."}),
++        }, "hidden": {"unique_id": "UNIQUE_ID"}}
++
++    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
++    RETURN_NAMES = ("video_with_audio", "timing_json", "session")
++    FUNCTION = "generate"
++    CATEGORY = "Sol Engine"
++    OUTPUT_NODE = True
++
++    @classmethod
++    def IS_CHANGED(cls, **kwargs):
++        # Every queued request must run: never time a ComfyUI cache hit.
++        return float("nan")
++
++    def generate(self, profile, prompt, seed, session, window_frames=39, keep_loaded=True,
++                 resolution="768p", image="", audio="",
++                 output_dir="", filename="",
++                 image_input=None, audio_1=None, audio_2=None, audio_3=None, unique_id=None):
++        if not prompt.strip():
++            raise ValueError("Enter a nonempty prompt")
++        if type(seed) is not int or not 0 <= seed < 2**63:
++            raise ValueError("Seed must be a nonnegative 63-bit integer")
++        import folder_paths
++        output_root = folder_paths.get_output_directory()
++        # Empty session => continue the newest take (Studio auto-continue / node convenience).
++        session = (session or "").strip() or latest_session(output_root)
++        if not 5 <= int(window_frames) <= 124:
++            raise ValueError("window_frames must be between 5 and 124")
++        # A wired reference makes this a ref2va extend: the new take carries its own
++        # images and audio, while the pinned window keeps the seam continuous.
++        images, audios = collect_references("reference", image, audio, image_input,
++                                            (audio_1, audio_2, audio_3))
++        if not images and not audios:
++            # obvpm's model: the chain inherits the conditioning of the take it
++            # continues. Attach references to replace it.
++            images, audios = inherited_references(session)
++        mode = "reference" if images else "text"
++        check_request(profile, mode, "local", resolution)
++        from comfy_api.latest import InputImpl
++        import comfy.model_management as mm
++        node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
++        publish(node, prompt_id, "queued", started)
++        try:
++            settings = load_profile(profile)
++            mm.unload_all_models()
++            mm.soft_empty_cache()
++            cold = not bridge.is_warm(settings, output_root)
++            steps = settings.get("steps", DEFAULT_STEPS.get(settings["precision"]))
++            publish(node, prompt_id, "loading" if cold else "conditioning", started, steps=steps)
++
++            def progress(update):
++                stage = update.get("stage", "generating")
++                if stage == "generating" and cold:
++                    stage = "loading"  # Without worker updates a cold start is mostly loading.
++                publish(node, prompt_id, stage, started, step=update.get("step"),
++                        steps=update.get("steps", steps), message=update.get("message", ""))
++
++            try:
++                result = bridge.generate(settings, output_root, prompt, seed,
++                                         cancel=mm.throw_exception_if_processing_interrupted,
++                                         mode=mode, images=images, audios=audios,
++                                         progress=progress, resolution=resolution,
++                                         extend={"session": session.strip(),
++                                                 "window_frames": int(window_frames)})
++            finally:
++                drop_scratch_copies(images + audios)
++                if not keep_loaded:
++                    bridge.close()
++            publish(node, prompt_id, "saving", started, steps=steps)
++            place_take(output_root, result, output_dir, filename, "extend", seed)
++            if prompt_id:
++                write_sidecar(output_root, prompt_id, result, "extend", seed, resolution)
++        except BaseException as error:
++            publish(node, prompt_id, "error", started, message=str(error) or type(error).__name__)
++            raise
++        publish(node, prompt_id, "done", started, steps=steps, step=steps,
++                message="%.1f s" % result.get("e2e_s", 0))
++        report = json.dumps(result, indent=2, ensure_ascii=False)
++        relative = Path(result["output"]).resolve().relative_to(Path(output_root).resolve())
++        video = {"filename": relative.name, "subfolder": relative.parent.as_posix(), "type": "output"}
++        session_out = result.get("session") or ""
++        return {"ui": {"text": [report], "solh3_video": [video]},
++                "result": (InputImpl.VideoFromFile(result["output"]), report, session_out)}
++
++
++NODE_CLASS_MAPPINGS = {"SolH3Generate": SolH3Generate, "SolH3Release": SolH3Release,
++                       "SolH3Extend": SolH3Extend}
+ NODE_DISPLAY_NAME_MAPPINGS = {"SolH3Generate": "Sol-H3 · Generate Video",
+-                              "SolH3Release": "Sol-H3 · Release GPU"}
++                              "SolH3Release": "Sol-H3 · Release GPU",
++                              "SolH3Extend": "Sol-H3 · Extend Video"}
+diff --git a/sol_h3_engine/comfy_routes.py b/sol_h3_engine/comfy_routes.py
+index d5e6876..124b4ea 100644
+--- a/sol_h3_engine/comfy_routes.py
++++ b/sol_h3_engine/comfy_routes.py
+@@ -5,6 +5,7 @@ from pathlib import Path
+ 
+ LIBRARY = Path("SolH3") / "library"
+ MATCH_WINDOW_S = 600  # SaveVideo writes its MP4 shortly after the node's sidecar.
++DEDUPE_WINDOW_S = 30  # A SaveVideo copy of the same take lands within seconds of it.
+ 
+ 
+ def _sidecars(output_root):
+@@ -20,52 +21,120 @@ def _sidecars(output_root):
+ 
+ 
+ def list_videos(output_root, limit=24, history=None):
+-    """Newest-first SolH3/**/*.mp4 merged with node sidecars.
++    """One entry per Sol-H3 take, newest first.
+ 
+-    `history(prompt_id)` may return saved (subfolder, filename) pairs from ComfyUI's
+-    history for an exact match; otherwise a sidecar claims the first MP4 written after it.
++    A take is the file the node itself wrote (its readable path); older records
++    fall back to claiming an MP4 written around that moment. MP4s in the output
++    tree that a take already explains -- a SaveVideo copy of the same take --
++    are skipped, so the library never lists one clip twice.
+     """
+     root = Path(output_root).resolve()
++    records = _sidecars(root)
+     videos = []
+     for path in (root / "SolH3").rglob("*.mp4"):
+-        if LIBRARY in path.relative_to(root).parents:
++        relative = path.relative_to(root)
++        if relative.parts[:2] == ("SolH3", "library"):
+             continue
+         videos.append((path.stat().st_mtime, path))
+     videos.sort()
+-    meta, claimed, known = {}, set(), {path for _, path in videos}
+-    for record in _sidecars(root):
+-        exact = []
+-        if history is not None and record.get("id"):
++    known = {path for _, path in videos}
++
++    items, claimed, windows, duplicates = [], set(), [], []
++    for record in records:
++        created = record.get("created")
++        if isinstance(created, (int, float)):
++            windows.append((created - 2, created + MATCH_WINDOW_S))
++            duplicates.append((created - DEDUPE_WINDOW_S, created + DEDUPE_WINDOW_S))
++        path = None
++        saved = record.get("output_path")
++        if saved:
++            candidate = Path(saved)
++            if candidate.is_file():
++                path = candidate
++        if path is None and history is not None and record.get("id"):
+             try:
+                 exact = [root / sub / name for sub, name in history(record["id"]) or ()]
+             except Exception:
+-                exact = []  # History is an optimization; mtime matching still works.
+-        match = next((p for p in exact if p in known and p not in claimed), None)
+-        if match is None:
+-            match = next((p for mtime, p in videos if p not in claimed
+-                          and record["created"] - 2 <= mtime <= record["created"] + MATCH_WINDOW_S), None)
+-        if match is not None:
+-            claimed.add(match)
+-            meta[match] = record
+-    items = []
+-    for mtime, path in reversed(videos):
+-        record = meta.get(path, {})
+-        relative = path.relative_to(root)
++                exact = []
++            path = next((p for p in exact if p in known and p not in claimed), None)
++        if path is None and isinstance(created, (int, float)):
++            path = next((p for mtime, p in videos if p not in claimed
++                          and created - 2 <= mtime <= created + MATCH_WINDOW_S), None)
++        if path is None:
++            continue
++        try:
++            relative = path.relative_to(root)
++        except ValueError:
++            continue
++        claimed.add(path)
+         items.append({"id": relative.as_posix(), "file": path.name,
+                       "subfolder": relative.parent.as_posix(), "type": "output",
+                       "prompt_id": record.get("id"), "prompt": record.get("prompt"),
+                       "mode": record.get("mode"), "profile": record.get("profile"),
+                       "seed": record.get("seed"), "e2e_s": record.get("e2e_s"),
+-                      "created": record.get("created", mtime)})
+-        if len(items) >= limit:
+-            break
+-    return {"items": items}
++                      "created": record.get("created", path.stat().st_mtime)})
++
++    # MP4s no take claims: show them unless a take already explains that moment.
++    # A SaveVideo copy of a take lands seconds after it, so only a short window
++    # counts as "the same take" -- a wider one would swallow unrelated clips.
++    for mtime, path in videos:
++        if path in claimed or any(a <= mtime <= b for a, b in duplicates):
++            continue
++        relative = path.relative_to(root)
++        items.append({"id": relative.as_posix(), "file": path.name,
++                      "subfolder": relative.parent.as_posix(), "type": "output",
++                      "prompt_id": None, "prompt": None, "mode": None, "profile": None,
++                      "seed": None, "e2e_s": None, "created": mtime})
++
++    items.sort(key=lambda row: row["created"], reverse=True)
++    return {"items": items[:limit]}
++
++
++def list_sessions(output_root, limit=40):
++    """Take sessions newest first, so the Studio can continue any of them.
++
++    A session is the latents of one finished take: the Extend node pins its tail
++    window and renders the next segment from it.
++    """
++    root = Path(output_root).resolve()
++    records = {}
++    for record in _sidecars(root):
++        saved = record.get("session")
++        if not saved:
++            continue
++        try:
++            records[Path(saved).resolve().relative_to(root).as_posix()] = record
++        except (ValueError, OSError):
++            continue
++    items = []
++    for path in root.glob("sol_h3/*/request-*/session.session.safetensors"):
++        try:
++            stat = path.stat()
++        except OSError:
++            continue
++        try:
++            key = path.resolve().relative_to(root).as_posix()
++        except ValueError:
++            continue
++        record = records.get(key, {})
++        video = None
++        for candidate in ("hyperflow.mp4", "hyperflow.delivered.mp4"):
++            if (path.parent / candidate).is_file():
++                video = candidate
++                break
++        items.append({"id": key, "session": str(path), "video": video,
++                      "output": record.get("output_path"),
++                      "mode": record.get("mode"), "prompt": record.get("prompt"),
++                      "profile": record.get("profile"), "seed": record.get("seed"),
++                      "created": record.get("created", stat.st_mtime)})
++    items.sort(key=lambda row: row["created"], reverse=True)
++    return {"items": items[:limit]}
+ 
+ 
+ def video_path(output_root, identity):
+     root = Path(output_root).resolve()
+     path = (root / str(identity or "")).resolve()
+-    path.relative_to(root / "SolH3")  # ValueError outside the Studio library.
++    path.relative_to(root)  # ValueError outside the output folder.
+     if path.suffix != ".mp4" or not path.is_file():
+         raise ValueError("Saved video unavailable")
+     return path
+@@ -74,9 +143,9 @@ def video_path(output_root, identity):
+ def thumbnail(output_root, identity):
+     """First frame as JPEG, cached; needs PyAV (ComfyUI's video dependency)."""
+     path = video_path(output_root, identity)
+-    cache = Path(output_root).resolve() / LIBRARY / "thumbs"
+-    saved = cache / (path.relative_to(Path(output_root).resolve() / "SolH3").as_posix()
+-                     .replace("/", "__") + ".jpg")
++    root = Path(output_root).resolve()
++    cache = root / LIBRARY / "thumbs"
++    saved = cache / (path.relative_to(root).as_posix().replace("/", "__") + ".jpg")
+     if saved.is_file() and saved.stat().st_mtime >= path.stat().st_mtime:
+         return saved.read_bytes()
+     import av  # ImportError -> 404 at the route.
+@@ -196,6 +265,15 @@ def register():
+                                        limit, lambda pid: list(history(pid)))
+         return web.json_response(rows, headers=no_store)
+ 
++    @routes.get("/solh3/sessions")
++    async def sessions(request):
++        try:
++            limit = max(1, min(200, int(request.query.get("limit", "40"))))
++        except ValueError:
++            raise web.HTTPBadRequest(text="limit must be an integer") from None
++        rows = await asyncio.to_thread(list_sessions, folder_paths.get_output_directory(), limit)
++        return web.json_response(rows, headers=no_store)
++
+     @routes.get("/solh3/library/thumbnail")
+     async def preview(request):
+         try:
+diff --git a/sol_h3_engine/extend.py b/sol_h3_engine/extend.py
+new file mode 100644
+index 0000000..3147802
+--- /dev/null
++++ b/sol_h3_engine/extend.py
+@@ -0,0 +1,435 @@
++# Copyright 2026 The Sol-H3 authors. Licensed under the Apache License, Version 2.0.
++#
++# `frames` arithmetic is ported from comfyui-obvpm-timeline (frames.py), Copyright
++# the obvpm authors, MIT-style -- see THIRD_PARTY_NOTICES.md. The masked-continuation
++# semantics follow ComfyUI core PR #15375 (per-row denoise mask) and obvpm-timeline's
++# nodes_masked.py window rules.
++"""Native video extend (continuation) for the Sol-H3 engine -- the masked route.
++
++The previous clip's tail-window latents are written into the HEAD of the target's
++generated rows and pinned at the conditioning noise level for every denoising step,
++exactly as ComfyUI core's per-row denoise mask does it: a row held at mask 0 runs at
++the conditioning timestep, its latent is injected at cond strength
++(``0.999 * clean + 0.001 * noise`` -- the same footing a keyframe cond row stands on),
++and it is re-imposed after every scheduler step. The model therefore generates the
++continuation with the exact tail as context, and the window survives verbatim: no
++re-render, no level step, audio kept as-is.
++
++Grid arithmetic (video 17k+5 frames <-> 5k+2 latent steps, audio 40 steps/s) is a
++single implementation ported from obvpm-timeline's frames.py, trap tests included.
++
++Session sidecars (safetensors: video + audio latents + str metadata) carry a clip's
++latents between takes, modelled on obvpm's mctx format.
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++# ---------------------------------------------------------------------------
++# frame <-> latent arithmetic (ported from obvpm-timeline frames.py)
++# ---------------------------------------------------------------------------
++
++FPS = 24
++AUDIO_LATENT_FPS = 40
++FRAME_RESCALE = 5.0 / 3.0  # audio steps per video frame
++
++FRAMES_PER_GROUP = 17
++FRAME_BASE = 5
++LATENTS_PER_GROUP = 5
++LATENT_BASE = 2
++
++# Frames covered by each latent step, indexed by step % 5. Every fifth step spans
++# ONE frame, the rest span four.
++FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
++
++# Whole-step context windows, largest first (obvpm's WINDOW_LADDER without the
++# 1-frame rung, which is not tail-sliceable from a latent).
++WINDOW_LADDER = (124, 107, 90, 73, 56, 39, 22, 5)
++DEFAULT_WINDOW_FRAMES = 39
++
++SESSION_FORMAT = "solx-v1"
++SESSION_SUFFIX = ".session.safetensors"
++
++
++def frames_to_latents(frame_count):
++    """Latent steps the VAE produces for a clip of frame_count frames (on-grid)."""
++    if frame_count <= FRAME_BASE:
++        return LATENT_BASE
++    return ((frame_count - FRAME_BASE) // FRAMES_PER_GROUP) * LATENTS_PER_GROUP + LATENT_BASE
++
++
++def latents_to_frames(latent_t):
++    """Pixel frames of an on-grid clip with latent_t latent steps."""
++    return FRAMES_PER_GROUP * ((latent_t - LATENT_BASE) // LATENTS_PER_GROUP) + FRAME_BASE
++
++
++def frame_at_latent(k):
++    """First pixel frame of latent step k, valid for ANY k >= 0 (off-grid safe)."""
++    k = int(k)
++    if k <= 0:
++        return 0
++    full, rem = divmod(k, len(FRAME_PER_TOKEN))
++    return full * sum(FRAME_PER_TOKEN) + sum(FRAME_PER_TOKEN[:rem])
++
++
++def pixel_frames(latent_t):
++    """Pixel frames covered by latent_t steps from cycle phase 0."""
++    return frame_at_latent(latent_t)
++
++
++def steps_for_frames(n):
++    """Latent steps covering EXACTLY n pixel frames from phase 0, else None."""
++    k, covered = 0, 0
++    while covered < n:
++        covered += FRAME_PER_TOKEN[k % 5]
++        k += 1
++    return k if covered == n else None
++
++
++def snap_window(n):
++    """Largest ladder window <= n, or None when even 5 does not fit."""
++    for g in WINDOW_LADDER:
++        if g <= n:
++            return g
++    return None
++
++
++def audio_total(frame_count):
++    """Cumulative audio latent steps at a frame count. THE conversion."""
++    return int(round(frame_count / float(FPS) * AUDIO_LATENT_FPS))
++
++
++def tail_slice_start(total_steps, window_steps):
++    """Start step of a tail slice, verified to sit at cycle phase 0."""
++    if window_steps > total_steps:
++        raise ValueError(
++            "tail slice of %d steps from a %d step latent" % (window_steps, total_steps))
++    start = total_steps - window_steps
++    if start % LATENTS_PER_GROUP != 0:
++        raise ValueError(
++            "tail slice of %d steps from a %d step latent starts at cycle phase %d, "
++            "not 0; the slice would be unsound"
++            % (window_steps, total_steps, start % LATENTS_PER_GROUP))
++    return start
++
++
++def handover_frames(covered, steps, place="before", decode_edge=True):
++    """Where responsibility for a hard-held window changes hands (frames, in-window).
++
++    Ported from obvpm nodes_masked.handover_frames for the hard-hold profile
++    (ramp 0, edge 0, deep 0): a before-pin hands over one latent step inside its
++    edge when decode_edge is set -- H3's video VAE draws a file's last step with
++    nothing after it, so the older clip's frames there are its decode edge while
++    the take decoded the very same latents mid-file.
++    """
++    covered = int(covered)
++    steps = int(steps)
++    if place == "after":
++        if decode_edge and steps > 2:
++            return frame_at_latent(2)
++        return 0
++    if decode_edge and steps > 1:
++        return frame_at_latent(steps - 1)
++    return covered
++
++
++# ---------------------------------------------------------------------------
++# session sidecars
++# ---------------------------------------------------------------------------
++
++def session_path_for(request_dir):
++    return Path(request_dir) / ("session" + SESSION_SUFFIX)
++
++
++def file_digest(path):
++    """SHA256 of a file, or "" when it cannot be read.
++
++    A take records the files it was conditioned on, so a later take that
++    inherits them can tell whether they are still the same ones. obvpm's
++    rule: a chain must never silently change its conditioning.
++    """
++    import hashlib
++    try:
++        digest = hashlib.sha256()
++        with open(path, "rb") as handle:
++            for chunk in iter(lambda: handle.read(1 << 20), b""):
++                digest.update(chunk)
++        return digest.hexdigest()
++    except OSError:
++        return ""
++
++
++def freeze_references(request_dir, images=(), audios=()):
++    """Copy a take's reference media into the take's own directory.
++
++    obvpm's rule, adapted to this engine: a chain's conditioning is an *artifact*
++    that lives with the take, not a recipe that has to be rebuilt. The engine
++    freezes the files it was handed into ``<request_dir>/refs/`` and records
++    their digests, so a later take picks up the very same conditioning -- after a
++    restart, after the source file was replaced, or after the input folder was
++    cleared. The source path is kept only as provenance.
++
++    Returns the records that go into the session sidecar's metadata.
++    """
++    import shutil
++    records = []
++    folder = Path(request_dir) / "refs"
++    for kind, paths, prefix in (("image", images, "ref"), ("audio", audios, "audio")):
++        for index, source in enumerate(paths, 1):
++            source = Path(source)
++            if not source.is_file():
++                raise ValueError("Reference file not found: %s" % source)
++            suffix = source.suffix.lower() or (".png" if kind == "image" else ".wav")
++            folder.mkdir(parents=True, exist_ok=True)
++            target = folder / ("%s_%02d%s" % (prefix, index, suffix))
++            shutil.copyfile(str(source), str(target))
++            records.append({"kind": kind, "path": str(target),
++                            "sha256": file_digest(str(target)), "source": str(source)})
++    return records
++
++
++def write_session(path, video, audio, meta):
++    """Atomic session write: tmp file + os.replace (MP4 first, then this)."""
++    from safetensors.torch import save_file
++    clean = {}
++    for key, value in dict(meta or {}).items():
++        if not isinstance(key, str):
++            raise ValueError("session metadata keys must be str, got %r" % (key,))
++        clean[key] = str(value)
++    clean["format"] = SESSION_FORMAT
++    tensors = {"video": video.detach().contiguous().cpu(),
++               "audio": audio.detach().contiguous().cpu()}
++    path = Path(path)
++    tmp = path.with_name(path.name + ".tmp")
++    save_file(tensors, str(tmp), metadata=clean)
++    os.replace(str(tmp), str(path))
++    return str(path)
++
++
++def load_session(path):
++    """Read a session sidecar -> {"video", "audio", "meta"} with validation."""
++    import torch
++    from safetensors import safe_open
++    from safetensors.torch import load_file
++    path = Path(path)
++    if not path.is_file():
++        raise ValueError("session sidecar not found: %s" % path)
++    with safe_open(str(path), framework="pt") as handle:
++        meta = dict(handle.metadata() or {})
++    if meta.get("format") != SESSION_FORMAT:
++        raise ValueError(
++            "%s is not a %s session sidecar (format=%r)" % (path, SESSION_FORMAT, meta.get("format")))
++    tensors = load_file(str(path))
++    video, audio = tensors["video"], tensors["audio"]
++    if video.dim() != 5 or video.shape[0] != 1 or audio.dim() != 3 or audio.shape[0] != 2:
++        raise ValueError(
++            "%s holds unexpected latent shapes: video %s, audio %s"
++            % (path, tuple(video.shape), tuple(audio.shape)))
++    return {"video": video, "audio": audio, "meta": meta}
++
++
++def slice_tail_window(session, window_frames=DEFAULT_WINDOW_FRAMES):
++    """The tail window of a loaded session, on-grid and phase-0 verified.
++
++    Returns (video_window (1, 24, steps, h, w), audio_window (2, 32, audio_steps), info).
++    """
++    video, audio, meta = session["video"], session["audio"], session["meta"]
++    raw_steps = int(video.shape[2])
++    raw_frames = int(meta.get("raw_frames") or latents_to_frames(raw_steps))
++    if int(meta.get("raw_frames") or raw_frames) != raw_frames:
++        raise ValueError("session raw_frames %s disagrees with the stored latent (%d frames)"
++                         % (meta.get("raw_frames"), raw_frames))
++    n = int(window_frames)
++    if n > raw_frames:
++        snapped = snap_window(raw_frames)
++        raise ValueError(
++            "window of %d frames exceeds the session's %d frames; nearest legal window is %s"
++            % (n, raw_frames, snapped if snapped else "nothing"))
++    steps = steps_for_frames(n)
++    if steps is None:
++        raise ValueError("%d frames is not a whole number of latent steps" % n)
++    start = tail_slice_start(raw_steps, steps)
++    if frame_at_latent(start) != start and False:  # pragma: no cover - documentation guard
++        raise RuntimeError("step mapping disagreement")
++    video_window = video[:, :, start:start + steps].clone()
++    covered = pixel_frames(steps)
++    if covered != n:
++        raise RuntimeError("%d steps cover %d frames, expected %d" % (steps, covered, n))
++    # Audio: end-aligned with the video window's END, on cumulative totals.
++    total_audio = int(audio.shape[-1])
++    want = audio_total(raw_frames) - audio_total(raw_frames - n)
++    if want <= 0 or total_audio < want:
++        raise ValueError(
++            "session audio latent (%d steps) cannot supply a %d step window"
++            % (total_audio, want))
++    audio_window = audio[:, :, total_audio - want:].clone()
++    handover = handover_frames(covered, steps, "before", decode_edge=True)
++    info = {
++        "window_frames": n, "window_steps": steps, "covered_frames": covered,
++        "audio_steps": want, "source_start_step": start, "source_start_frame": frame_at_latent(start),
++        "raw_frames": raw_frames, "raw_steps": raw_steps, "total_audio_steps": total_audio,
++        "handover_frames": handover, "delivered_frames": raw_frames - handover,
++        "source_path": meta.get("source_path", ""), "self_id": meta.get("self_id", ""),
++    }
++    return video_window, audio_window, info
++
++
++def build_extend(session_path, window_frames=DEFAULT_WINDOW_FRAMES,
++                 session_target=None, session_meta=None):
++    """Load a session and slice its tail window into an extend context.
++
++    The context is consumed by the engine's pipeline patches (see
++    hyperflow_worker.install_extend_patches): the raw window latents, the geometry
++    the patches derive their row indices from, and the session target the new
++    take's own sidecar is written to.
++    """
++    session = load_session(session_path)
++    video_window, audio_window, info = slice_tail_window(session, window_frames)
++    meta = dict(session["meta"])
++    context = {
++        "window_video": video_window,       # (1, 24, W, h, w) clean
++        "window_audio": audio_window,       # (2, 32, WA) clean
++        "window_steps": info["window_steps"],
++        "audio_steps": info["audio_steps"],
++        "info": info,
++        "parent_meta": meta,
++        "session": str(session_path),
++        "parent_id": meta.get("self_id", ""),
++        "session_target": str(session_target) if session_target else None,
++        "session_meta": dict(session_meta or {}),
++        "session_written": None,
++        # filled by the patches at run time:
++        "cond_video_rows": None,             # (W * rows_per_frame, C * patch) at cond strength
++        "audio_rows_ch0": None, "audio_rows_ch1": None,
++        "pin_video_rows": None, "pin_audio_rows": None,
++        "window_video_rows": None,
++    }
++    return context
++
++
++# ---------------------------------------------------------------------------
++# per-row (t, r) plan with the window pinned (port of build_row_time_pairs + pins)
++# ---------------------------------------------------------------------------
++
++def build_extend_row_pairs(
++    *,
++    video_indices,
++    audio_indices,
++    num_condition_video_rows,
++    num_condition_audio_rows,
++    num_text_tokens,
++    video_timestep,
++    video_endpoint,
++    audio_timestep,
++    audio_endpoint,
++    condition_video_timestep,
++    condition_audio_timestep=1.0,
++    pin_video_rows=(),
++    pin_audio_rows=(),
++):
++    """Assign a (t, r) pair to every row, with the pinned window rows at the
++    conditioning level, and reduce to the transformer's (timestep, endpoint, indices).
++
++    Faithful port of hyperflow_h3.schedule.build_row_time_pairs plus one rule: the
++    extend window's video rows ride at the visual conditioning timestep (the same
++    footing a keyframe cond row stands on) and its audio rows at t = r = 1.0 (the
++    audio-reference level). The unique pair set therefore matches the fl2va
++    ("image") or fl2va+audio-reference ("image_audio") conditioning variants, so
++    the precomputed AdaLN tables cover an extend without regeneration.
++    """
++    import torch
++    video_indices = video_indices.cpu()
++    audio_indices = audio_indices.cpu()
++    sequence_length = int(video_indices.numel() + audio_indices.numel() + num_text_tokens)
++
++    timestep = torch.full((sequence_length,), float(video_timestep), dtype=torch.float32)
++    endpoint = torch.full((sequence_length,), float(video_endpoint), dtype=torch.float32)
++
++    condition_video = video_indices[:num_condition_video_rows]
++    timestep[condition_video] = float(condition_video_timestep)
++    endpoint[condition_video] = float(condition_video_timestep)
++
++    generated_audio = audio_indices[num_condition_audio_rows:]
++    timestep[generated_audio] = float(audio_timestep)
++    endpoint[generated_audio] = float(audio_endpoint)
++
++    condition_audio = audio_indices[:num_condition_audio_rows]
++    timestep[condition_audio] = float(condition_audio_timestep)
++    endpoint[condition_audio] = float(condition_audio_timestep)
++
++    for rows, value in ((pin_video_rows, condition_video_timestep),
++                        (pin_audio_rows, condition_audio_timestep)):
++        if len(rows):
++            index = torch.as_tensor(list(rows), dtype=torch.long)
++            timestep[index] = float(value)
++            endpoint[index] = float(value)
++
++    pairs = torch.stack((timestep, endpoint), dim=-1)
++    unique_pairs, indices = torch.unique(pairs, dim=0, sorted=True, return_inverse=True)
++    return unique_pairs[:, 0].contiguous(), unique_pairs[:, 1].contiguous(), indices
++
++
++# ---------------------------------------------------------------------------
++# trap tests: python extend.py
++# ---------------------------------------------------------------------------
++
++def _self_test():
++    for k in range(0, 40):
++        n = FRAMES_PER_GROUP * k + FRAME_BASE
++        t = frames_to_latents(n)
++        assert t == LATENTS_PER_GROUP * k + LATENT_BASE, (n, t)
++        assert latents_to_frames(t) == n, (n, t)
++
++    assert frame_at_latent(0) == 0
++    assert frame_at_latent(2) == 5
++    assert frame_at_latent(37) == 124 == latents_to_frames(37)
++    assert pixel_frames(12) == 39
++    assert pixel_frames(37) == 124
++    assert steps_for_frames(39) == 12
++    assert steps_for_frames(124) == 37
++    assert steps_for_frames(2) is None
++    assert audio_total(124) == 207
++    assert audio_total(39) == 65
++    assert audio_total(124) - audio_total(85) == 65
++
++    # the engine's own geometry: a 124-frame clip's tail window
++    assert tail_slice_start(37, 12) == 25
++    assert 25 % LATENTS_PER_GROUP == 0
++    assert handover_frames(39, 12, "before", decode_edge=True) == 35
++    assert handover_frames(39, 12, "before", decode_edge=False) == 39
++    assert handover_frames(39, 12, "after", decode_edge=True) == 5
++    assert snap_window(39) == 39 and snap_window(30) == 22 and snap_window(3) is None
++
++    # the row plan: window rows pinned, unique pairs unchanged in count
++    import torch
++    text, audio_t, video_t = 300, 207, 37
++    rows_per_frame = 4032
++    window_rows, window_steps, window_audio = 12, 12, 65
++    seq = text + audio_t * 2 + video_t * rows_per_frame
++    video_indices = torch.arange(text + audio_t * 2, seq)
++    audio_indices = torch.arange(text, text + audio_t * 2)
++    pin_video = video_indices[:window_rows * rows_per_frame].tolist()
++    pin_audio = audio_indices[:window_audio].tolist() + audio_indices[audio_t:audio_t + window_audio].tolist()
++    t_p, r_p, idx = build_extend_row_pairs(
++        video_indices=video_indices, audio_indices=audio_indices,
++        num_condition_video_rows=0, num_condition_audio_rows=0, num_text_tokens=text,
++        video_timestep=0.0, video_endpoint=0.1, audio_timestep=0.2, audio_endpoint=0.3,
++        condition_video_timestep=0.999, condition_audio_timestep=1.0,
++        pin_video_rows=pin_video, pin_audio_rows=pin_audio)
++    assert t_p.numel() == 4, t_p.tolist()          # video, audio, cond video, cond audio
++    assert idx.numel() == seq
++    # every window row maps to the cond pair; the rest keep their stream pair
++    pair_index = {(round(a, 6), round(b, 6)): i for i, (a, b) in enumerate(zip(t_p.tolist(), r_p.tolist()))}
++    cond_v = pair_index[(0.999, 0.999)]
++    cond_a = pair_index[(1.0, 1.0)]
++    assert idx[pin_video[0]].item() == cond_v and idx[pin_video[-1]].item() == cond_v
++    assert idx[pin_audio[0]].item() == cond_a and idx[pin_audio[-1]].item() == cond_a
++    assert idx[video_indices[window_rows * rows_per_frame].item()].item() == pair_index[(0.0, 0.1)]
++    assert idx[audio_indices[window_audio].item()].item() == pair_index[(0.2, 0.3)]
++    return True
++
++
++if __name__ == "__main__":
++    _self_test()
++    print("extend.py: all trap tests passed")
+diff --git a/sol_h3_engine/hyperflow_worker.py b/sol_h3_engine/hyperflow_worker.py
+index 6c7b8b7..417f94d 100644
+--- a/sol_h3_engine/hyperflow_worker.py
++++ b/sol_h3_engine/hyperflow_worker.py
+@@ -117,6 +117,250 @@ def pin_unmatched_group(model):
+         sum(p.numel() * p.element_size() for p in group.parameters)
+ 
+ 
++
++def _audio_reference_32k(path, vae_rate=32000):
++    """MiniMaxH3AudioReference already resampled onto the audio VAE's rate.
++
++    torchaudio is unavailable for this torch build, so decode with PyAV and
++    resample with its own AudioResampler; the reference then carries no
++    sample_rate (the VAE's own), skipping the official torchaudio resample.
++    """
++    import av
++    import torch
++    from diffusers.modular_pipelines.minimax_h3.references import MiniMaxH3AudioReference
++    with av.open(str(path)) as container:
++        stream = next(s for s in container.streams if s.type == "audio")
++        resampler = av.AudioResampler(format="fltp", rate=vae_rate, layout=stream.layout)
++        chunks = []
++        for frame in container.decode(stream):
++            for resampled in resampler.resample(frame):
++                chunks.append(resampled.to_ndarray())
++    if not chunks:
++        raise ValueError(f"No audio stream content in {path}")
++    waveform = torch.from_numpy(chunks[0] if len(chunks) == 1 else _concat_planar(chunks)).float()
++    return MiniMaxH3AudioReference(audio=waveform)
++
++
++def _concat_planar(chunks):
++    import numpy as np
++    width = max(c.shape[1] for c in chunks[:-1]) + chunks[-1].shape[1]
++    total = sum(c.shape[1] for c in chunks)
++    out = np.zeros((chunks[0].shape[0], total), dtype=chunks[0].dtype)
++    pos = 0
++    for c in chunks:
++        out[:, pos:pos + c.shape[1]] = c
++        pos += c.shape[1]
++    del width
++    return out
++
++
++# ---------------------------------------------------------------------------
++# Extend (masked continuation): the four pipeline-block patches
++# ---------------------------------------------------------------------------
++
++# Process-global request state for the extend patches. One worker process serves
++# one request at a time, so a module-level slot is enough. "window" is the
++# context built by extend.build_extend(); "session_target"/"session_meta" make
++# every take write its latents sidecar for the next extend in the chain.
++_EXTEND = {"window": None, "session_target": None, "session_meta": None}
++
++try:  # package import under ComfyUI, flat import in the worker process
++    from . import extend as _extend
++except ImportError:  # pragma: no cover - worker process
++    import extend as _extend
++
++
++def install_extend_patches():
++    """Wrap the four blocks a masked extend needs; idempotent, once per process.
++
++    With ``_EXTEND["window"]`` set, the target's head rows are replaced by the
++    source clip's tail window at the conditioning level, pinned there for every
++    denoising step and re-imposed after each scheduler step -- ComfyUI core
++    PR #15375's per-row mask semantics, ported to the Diffusers pipeline. After
++    the loop the window latents are restored to their clean values (so the decode
++    and the session sidecar carry the exact source latents) and the take's own
++    session sidecar is written.
++    """
++    if getattr(install_extend_patches, "_solh3_extend", False):
++        return
++    import torch
++    from diffusers.utils.torch_utils import randn_tensor
++    from diffusers.modular_pipelines.minimax_h3.before_denoise import (
++        MiniMaxH3PrepareLatentsStep, patchify_video_latents)
++    from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3AfterDenoiseStep
++    from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopSchedulerStep
++    from hyperflow_h3.blocks import HyperFlowSetTimestepsStep
++    from hyperflow_h3.schedule import shift_sigmas, endpoints_from_sigmas
++
++    # -- 1. prepare_latents: inject the window at cond strength ------------------
++    original = MiniMaxH3PrepareLatentsStep.__call__
++
++    def prepare_latents_extend(self, components, state, _original=original):
++        result = _original(self, components, state)
++        window = _EXTEND.get("window")
++        if window is None:
++            return result
++        block_state = self.get_block_state(state)
++        device = components._execution_device
++        patch_size = components.patch_size
++        rows_per_frame = ((block_state.latent_height // patch_size[1])
++                          * (block_state.latent_width // patch_size[2]))
++        window_video_rows = window["window_steps"] * rows_per_frame
++        if block_state.latents.shape[0] < window_video_rows:
++            raise RuntimeError("extend window (%d rows) exceeds the target's video rows (%d)"
++                               % (window_video_rows, block_state.latents.shape[0]))
++        # One noise draw from the request generator, after the stream draws: the
++        # 0.001 component of the cond-strength value, exactly as the keyframe
++        # conditioning noises its anchors.
++        noise = randn_tensor(window["window_video"].shape, generator=block_state.generator,
++                             device=device, dtype=torch.float32)
++        noised = components.scheduler.scale_noise(
++            window["window_video"].to(device, torch.float32), components.keyframe_noise_aug, noise)
++        cond_rows = patchify_video_latents(noised, patch_size)
++        window["cond_video_rows"] = cond_rows
++        window["window_video_rows"] = window_video_rows
++        audio = block_state.audio_latents
++        steps = window["audio_steps"]
++        total = block_state.num_audio_latents
++        if audio.shape[0] < total + steps:
++            raise RuntimeError("extend audio window (%d+%d steps) exceeds the target's audio rows (%d)"
++                               % (total, steps, audio.shape[0]))
++        ch0 = window["window_audio"][0].t().to(device, audio.dtype).contiguous()
++        ch1 = window["window_audio"][1].t().to(device, audio.dtype).contiguous()
++        window["audio_rows_ch0"], window["audio_rows_ch1"] = ch0, ch1
++        block_state.latents[:window_video_rows] = cond_rows.to(block_state.latents.dtype)
++        audio[:steps] = ch0
++        audio[total:total + steps] = ch1
++        self.set_block_state(state, block_state)
++        return result
++
++    MiniMaxH3PrepareLatentsStep.__call__ = prepare_latents_extend
++
++    # -- 2. set_timesteps: pin the window rows at the conditioning level ---------
++    original = HyperFlowSetTimestepsStep.__call__
++
++    def set_timesteps_extend(self, components, state, _original=original):
++        result = _original(self, components, state)
++        window = _EXTEND.get("window")
++        # The plan is an intermediate output: read it from the PipelineState, not
++        # from get_block_state (which only carries this block's declared inputs).
++        plan = state.get("row_timestep_plan")
++        if plan:
++            head = plan[0]
++            _EXTEND["adaln_key"] = tuple(zip(head[0].float().tolist(), head[1].float().tolist()))
++        if window is None or not plan or len(plan[0]) != 3:
++            return result  # the official (passthrough) plan carries no endpoints
++        block_state = self.get_block_state(state)
++        device = components._execution_device
++        video_sigmas = shift_sigmas(self.sigmas, float(components.scheduler.shift))
++        audio_sigmas = shift_sigmas(self.sigmas, float(components.audio_scheduler.shift))
++        video_endpoints = endpoints_from_sigmas(video_sigmas)
++        audio_endpoints = endpoints_from_sigmas(audio_sigmas)
++        video_timesteps = components.scheduler.timesteps.cpu()
++        audio_timesteps = components.audio_scheduler.timesteps.cpu()
++        patch_size = components.patch_size
++        latent_height = state.get("latent_height")
++        latent_width = state.get("latent_width")
++        rows_per_frame = ((latent_height // patch_size[1]) * (latent_width // patch_size[2]))
++        ncv = block_state.num_condition_video_rows
++        nca = block_state.num_condition_audio_rows
++        window_video_rows = window["window_steps"] * rows_per_frame
++        audio_steps = window["audio_steps"]
++        total_audio = state.get("num_audio_latents")
++        # The window occupies the head of the GENERATED section of each stream:
++        # its video rows follow any conditioning rows, its audio rows are the
++        # channel-major head of each stereo channel.
++        pin_video = block_state.video_indices[ncv:ncv + window_video_rows].tolist()
++        pin_audio = (block_state.audio_indices[nca:nca + audio_steps].tolist()
++                     + block_state.audio_indices[nca + total_audio:nca + total_audio + audio_steps].tolist())
++        window["pin_video_rows"], window["pin_audio_rows"] = pin_video, pin_audio
++        new_plan = []
++        for step in range(len(plan)):
++            triple = _extend.build_extend_row_pairs(
++                video_indices=block_state.video_indices,
++                audio_indices=block_state.audio_indices,
++                num_condition_video_rows=ncv,
++                num_condition_audio_rows=nca,
++                num_text_tokens=block_state.text_indices.numel(),
++                video_timestep=float(video_timesteps[step]),
++                video_endpoint=float(video_endpoints[step]),
++                audio_timestep=float(audio_timesteps[step]),
++                audio_endpoint=float(audio_endpoints[step]),
++                condition_video_timestep=max(float(video_timesteps[step]), components.keyframe_noise_aug),
++                condition_audio_timestep=1.0,
++                pin_video_rows=pin_video, pin_audio_rows=pin_audio)
++            new_plan.append(tuple(tensor.to(device) for tensor in triple))
++        state.set("row_timestep_plan", new_plan)
++        head = new_plan[0]
++        _EXTEND["adaln_key"] = tuple(zip(head[0].float().tolist(), head[1].float().tolist()))
++        return result
++
++    HyperFlowSetTimestepsStep.__call__ = set_timesteps_extend
++
++    # -- 3. scheduler step: re-impose the window rows after every step -----------
++    original = MiniMaxH3LoopSchedulerStep.__call__
++
++    def scheduler_step_extend(self, components, block_state, i, t, _original=original):
++        result = _original(self, components, block_state, i, t)
++        window = _EXTEND.get("window")
++        if window is None or window["cond_video_rows"] is None:
++            return result
++        ncv = block_state.num_condition_video_rows
++        block_state.latents[ncv:ncv + window["window_video_rows"]] = \
++            window["cond_video_rows"].to(block_state.latents)
++        audio = block_state.audio_latents
++        nca = block_state.num_condition_audio_rows
++        steps = window["audio_steps"]
++        # The reference audio rows (nca) sit in front of the generated ones, so the
++        # generated rows per channel are what is left after them -- the same count
++        # the row plan pins the window against (num_audio_latents).
++        total = (audio.shape[0] - nca) // 2  # channel-major rows: T steps per stereo channel
++        audio[nca:nca + steps] = window["audio_rows_ch0"].to(audio)
++        audio[nca + total:nca + total + steps] = window["audio_rows_ch1"].to(audio)
++        return result
++
++    MiniMaxH3LoopSchedulerStep.__call__ = scheduler_step_extend
++
++    # -- 4. after_denoise: clean window latents + the take's session sidecar -----
++    original = MiniMaxH3AfterDenoiseStep.__call__
++
++    def after_denoise_extend(self, components, state, _original=original):
++        result = _original(self, components, state)
++        window = _EXTEND.get("window")
++        block_state = self.get_block_state(state)
++        if window is not None:
++            block_state.latents[:, :, :window["window_steps"]] = \
++                window["window_video"].to(block_state.latents)
++            block_state.audio_latents[:, :, :window["audio_steps"]] = \
++                window["window_audio"].to(block_state.audio_latents)
++        target = _EXTEND.get("session_target")
++        if target:
++            meta = dict(_EXTEND.get("session_meta") or {})
++            meta.setdefault("raw_frames", _extend.pixel_frames(block_state.num_latent_frames))
++            meta.setdefault("raw_steps", int(block_state.num_latent_frames))
++            meta.setdefault("audio_steps_total", int(block_state.num_audio_latents))
++            if window is not None:
++                info = window["info"]
++                meta.setdefault("pinned_head_frames", info["covered_frames"])
++                meta.setdefault("window_frames", info["window_frames"])
++                meta.setdefault("delivered_frames", info["delivered_frames"])
++                meta.setdefault("handover_frames", info["handover_frames"])
++                meta.setdefault("parent_session", window["session"])
++                meta.setdefault("parent_id", window["parent_id"])
++            else:
++                meta.setdefault("pinned_head_frames", 0)
++                meta.setdefault("delivered_frames", meta["raw_frames"])
++            written = _extend.write_session(target, block_state.latents,
++                                            block_state.audio_latents, meta)
++            if window is not None:
++                window["session_written"] = written
++        self.set_block_state(state, block_state)
++        return result
++
++    MiniMaxH3AfterDenoiseStep.__call__ = after_denoise_extend
++    install_extend_patches._solh3_extend = True
++
++
+ class HyperFlow:
+     def __init__(self, options, paths):
+         overlay = options["hyperflow"]["deps"]
+@@ -187,6 +431,7 @@ class HyperFlow:
+             dump_qkv(os.environ["SOLH3_DUMP_QKV"])
+         if options["hyperflow"].get("fast_vae"):
+             self.load_fast_vae(options["hyperflow"]["fast_vae"])
++        install_extend_patches()
+         self.load_s = time.monotonic() - self.started
+ 
+     def install_dit(self, pipe, workflow):
+@@ -282,6 +527,9 @@ class HyperFlow:
+                 dump = os.environ.get("SOLH3_DUMP_LATENTS")
+                 if dump and _name == "MiniMaxH3VideoDecodeStep":  # diagnostics: the exact latents the decoder sees
+                     torch.save(self.get_block_state(state).latents.detach().cpu(), dump)
++                dump_audio = os.environ.get("SOLH3_DUMP_AUDIO_LATENTS")
++                if dump_audio and _name == "MiniMaxH3AudioDecodeStep":  # diagnostics: the audio latents likewise
++                    torch.save(self.get_block_state(state).audio_latents.detach().cpu(), dump_audio)
+                 if _name == "MiniMaxH3VideoDecodeStep" and _engine.fast_vae is not None:
+                     return _engine.fast_video_decode(self, components, state)
+                 t0 = time.monotonic()
+@@ -309,6 +557,8 @@ class HyperFlow:
+                 t0 = time.monotonic()
+                 if "vae" in _pinned:
+                     _pinned["vae"].to_gpu()
++                if "audio_vae" in _pinned and not _pinned["audio_vae"].on_gpu:
++                    _pinned["audio_vae"].to_gpu()  # ref2va reference soundtracks encode on the audio VAE too
+                 try:
+                     return _original(self, components, state)
+                 finally:
+@@ -316,6 +566,8 @@ class HyperFlow:
+                     PHASES[_name] = PHASES.get(_name, 0.0) + time.monotonic() - t0
+                     if "vae" in _pinned:
+                         _pinned["vae"].to_host()
++                    if "audio_vae" in _pinned and _pinned["audio_vae"].on_gpu:
++                        _pinned["audio_vae"].to_host()
+                         torch.cuda.empty_cache()
+             cls.__call__ = encode_staged
+             cls._solh3_staged = True
+@@ -384,8 +636,12 @@ class HyperFlow:
+         kwargs.setdefault("height", 768)
+         kwargs.setdefault("width", 1344)
+         if task == "ref2va":
+-            from diffusers.modular_pipelines.minimax_h3.references import MiniMaxH3ImageReference
+-            kwargs["references"] = [MiniMaxH3ImageReference.from_file(path) for path in kwargs.pop("reference_images")]
++            from diffusers.modular_pipelines.minimax_h3.references import (MiniMaxH3ImageReference,
++                                                                           MiniMaxH3AudioReference)
++            references = [MiniMaxH3ImageReference.from_file(path) for path in kwargs.pop("reference_images")]
++            for audio_path in kwargs.pop("reference_audios", None) or []:
++                references.append(_audio_reference_32k(audio_path))
++            kwargs["references"] = references
+         kwargs.update(num_frames=124, output_type="pt", generator=torch.Generator().manual_seed(case["seed"]))
+         PHASES.clear()
+         if swap_s > 0.5:
+@@ -406,6 +662,14 @@ class HyperFlow:
+                 part.to_host()
+             torch.cuda.empty_cache()
+             PHASES["decoders.to_cpu"] = time.monotonic() - t0
++        # Which precomputed AdaLN conditioning variant this request's row plan hit.
++        variant = None
++        key = _EXTEND.get("adaln_key")
++        if key is not None:
++            blocks = getattr(dit, "transformer_blocks", None)
++            starts = getattr(blocks[0].adaln_proj, "starts", None) if blocks else None
++            if starts is not None:
++                variant = ("hit" if tuple(key) in starts else "MISS") + ":%d" % len(key)
+         if steps[0] != 8:
+             raise RuntimeError("HyperFlow must run exactly 8 DiT forwards, got %d" % steps[0])
+         progress("saving", 8, 8)
+@@ -416,7 +680,29 @@ class HyperFlow:
+         t0 = time.monotonic()
+         write_mp4(output, video[:OUTPUT_FRAMES], audio, result["sampling_rate"])
+         PHASES["write_mp4"] = time.monotonic() - t0
+-        return {"output": str(output), "generate_s": time.monotonic() - started, "forwards": steps[0],
++        # A masked extend trims its pinned head: the take delivers from the
++        # handover frame on (obvpm's decode-edge rule), picture and sound together.
++        # The full clip stays for seam inspection; the delivered one is what a
++        # timeline chain plays.
++        delivered = None
++        window = _EXTEND.get("window")
++        if window is not None:
++            handover = int(window["info"]["handover_frames"])
++            rate = int(result["sampling_rate"])
++            cut = int(round(handover / float(FPS) * rate))
++            # Tail-match the delivered sound to exactly the delivered frame count:
++            # the engine writes 121 of 124 latent frames while the audio grid keeps
++            # all 207 ticks, so a plain head cut would leave ~130 ms of surplus per
++            # take -- which compounds down a chain (obvpm's trim rule).
++            frames = OUTPUT_FRAMES - handover
++            want = int(round(frames / float(FPS) * rate))
++            delivered = Path(out_dir) / "hyperflow.delivered.mp4"
++            t0 = time.monotonic()
++            write_mp4(delivered, video[handover:OUTPUT_FRAMES], audio[:, cut:cut + want], rate)
++            PHASES["write_delivered"] = time.monotonic() - t0
++        return {"output": str(output), "delivered_output": str(delivered) if delivered else None,
++                "generate_s": time.monotonic() - started, "forwards": steps[0],
++                "adaln_variant": variant,
+                 "phases_s": {k: round(v, 2) for k, v in PHASES.items()}}
+ 
+ 
+@@ -451,6 +737,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+     sys.path.insert(0, str(RUNTIME))
+     from runtime.qwen_ops.media import load_rgb, prepare_keyframe_image
+     mode, images = request.get("mode", "text"), list(request.get("images") or [])
++    audios = [a for a in (request.get("audios") or []) if a]
+     # 16:9 canvases, both axes multiples of 32 (the VAE's 16 x the 2x2 patch).
+     height, width = CANVAS[request.get("resolution", "768p")]
+     qcase = dict(case)
+@@ -463,6 +750,8 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+         qcase.update(task="fl2va", first_frame=images[0], keyframe_canvas=(height, width))
+         keyframes = [prepare_keyframe_image(load_rgb(images[0]), height, width, stretch=True)]
+     elif mode == "reference":
++        if len(audios) > 3:
++            raise ValueError("At most 3 audio references")
+         if not 1 <= len(images) <= 9:
+             raise ValueError("Reference mode needs 1 to 9 images")
+         # Qwen sees each reference at the canvas's pixel budget (Sol-H3 Spark ref2va "match"), not at a 2048 short
+@@ -493,6 +782,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+         out.update(keyframes=keyframes, keyframe_anchors=("first",))
+     if mode == "reference":
+         out["reference_images"] = images
++        out["reference_audios"] = audios
+     return out, receipt["request_wall_s"]
+ 
+ 
+@@ -527,6 +817,9 @@ def serve(options, write_json):
+             if request["op"] != "generate":
+                 raise ValueError("Unsupported operation")
+             progress_path = request.get("progress")
++            _EXTEND["window"] = None
++            _EXTEND["session_target"] = None
++            _EXTEND["session_meta"] = None
+ 
+             def progress(stage, step=None, steps=None):
+                 if progress_path:
+@@ -565,15 +858,84 @@ def serve(options, write_json):
+                     write_json(request["response"], {"status": "PASS", "payload": str(request_dir / "payload.pt"),
+                                                      "qwen_s": qwen_s, "task": case["task"]})
+                     continue
++                # Every take writes its latents sidecar, so the next extend in the
++                # chain has a source; an `extend` request additionally pins one.
++                if options["hyperflow"].get("session_sidecar", True):
++                    _EXTEND["session_target"] = str(_extend.session_path_for(request_dir))
++                    # The take's conditioning, frozen into its own directory: a later
++                    # take inherits this exact copy instead of rebuilding it from the
++                    # source, so a chain survives a restart, a replaced input file or
++                    # a cleared input folder (obvpm's artifact-over-recipe rule).
++                    frozen = _extend.freeze_references(request_dir, request.get("images") or [],
++                                                        request.get("audios") or [])
++                    _EXTEND["session_meta"] = {
++                        "self_id": case["case_id"], "prompt": case["prompt"],
++                        "seed": str(case["seed"]), "profile": options["name"],
++                        "resolution": str(request.get("resolution", "768p")),
++                        "task": payload.get("task", case["task"]), "source_path": "",
++                        # The frozen copies this take was conditioned on.
++                        "references": json.dumps(frozen),
++                    }
++                extend_request = request.get("extend")
++                if extend_request:
++                    mode = request.get("mode", "text")
++                    if mode not in ("text", "reference"):
++                        raise ValueError("An extend request carries text or reference conditioning "
++                                         "only (no other mode)")
++                    if mode == "reference" and not request.get("images"):
++                        raise ValueError("A reference extend needs at least one reference image")
++                    window_ctx = _extend.build_extend(
++                        extend_request["session"],
++                        window_frames=int(extend_request.get("window_frames",
++                                                             _extend.DEFAULT_WINDOW_FRAMES)),
++                        session_target=_EXTEND["session_target"],
++                        session_meta=_EXTEND["session_meta"])
++                    height, width = int(payload["height"]), int(payload["width"])
++                    latent_h, latent_w = window_ctx["window_video"].shape[-2:]
++                    if (latent_h, latent_w) != (height // 16, width // 16):
++                        raise ValueError(
++                            "The session's latents are %dx%d but this request renders %dx%d; "
++                            "an extend chain must keep one resolution"
++                            % (latent_h * 16, latent_w * 16, height, width))
++                    source_resolution = window_ctx["parent_meta"].get("resolution") or ""
++                    if source_resolution and source_resolution != str(request.get("resolution", "768p")):
++                        raise ValueError("The session was rendered at %s, this request at %s"
++                                         % (source_resolution, request.get("resolution", "768p")))
++                    _EXTEND["window"] = window_ctx
++                    # A reference extend keeps the ref2va task: the reference DiT and the
++                    # reference conditioning rows stay in play, and the pinned window rows
++                    # ride at the same conditioning levels (0.999 visual, 1.0 audio), so the
++                    # unique (timestep, endpoint) set -- and therefore the AdaLN table key --
++                    # is the one the ref2va variants already carry. A text extend stays t2va.
++                    if mode != "reference":
++                        case["task"] = "t2va"
+                 row = engine.generate(case, payload, request_dir, progress)
+                 e2e = (time.monotonic_ns() - started) / 1e9
+                 progress("done", 8, 8)
++                window = _EXTEND.get("window")
++                extend_report = {}
++                if window is not None:
++                    extend_report = {
++                        "window_frames": window["info"]["window_frames"],
++                        "window_steps": window["window_steps"],
++                        "audio_steps": window["audio_steps"],
++                        "delivered_frames": window["info"]["delivered_frames"],
++                        "handover_frames": window["info"]["handover_frames"],
++                        "parent_session": window["session"],
++                        "parent_id": window["parent_id"],
++                        "session": window.get("session_written"),
++                    }
+                 write_json(request["response"], {
+                     "status": "PASS", "case_id": case["case_id"], "seed": case["seed"],
+                     "task": case["task"], "output": row["output"], "e2e_s": e2e,
++                    "delivered_output": row.get("delivered_output"),
+                     "qwen_s": qwen_s, "qwen_encode_s": qwen_call_s if not request.get("conditioning") else 0.0,
+                     "h3_phases_s": {"generate_s": row["generate_s"], **row.get("phases_s", {})},
+-                    "forwards": row["forwards"], "profile": options["name"], "precision": "hyperflow",
++                    "forwards": row["forwards"], "adaln_variant": row.get("adaln_variant"),
++                    "session": (_EXTEND.get("session_target") if window is None
++                                else window.get("session_written")),
++                    "extend": extend_report,
++                    "profile": options["name"], "precision": "hyperflow",
+                     "decoder": "original", "single_stage": True, "cold_start": cold,
+                     "startup_and_warmup_s": engine.load_s if cold else 0, "prompt": case["prompt"],
+                     "timing": "request through completed MP4; model load reported separately"})
+@@ -581,6 +943,11 @@ def serve(options, write_json):
+                 write_json(request["response"], {"status": "FAIL",
+                                                  "error": "%s: %s" % (type(error).__name__, error)})
+                 raise
++            finally:
++                _EXTEND["window"] = None
++                _EXTEND["session_target"] = None
++                _EXTEND["session_meta"] = None
++                _EXTEND["adaln_key"] = None
+     finally:
+         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+         signal.signal(signal.SIGINT, signal.SIG_IGN)
+diff --git a/tests/test_layout.py b/tests/test_layout.py
+index a4621b3..db7b43e 100644
+--- a/tests/test_layout.py
++++ b/tests/test_layout.py
+@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("custom_sol_h3", root / "__init__.
+ module = importlib.util.module_from_spec(spec)
+ sys.modules[spec.name] = module
+ spec.loader.exec_module(module)
+-assert set(module.NODE_CLASS_MAPPINGS) == {"SolH3Generate", "SolH3Release"}
++assert set(module.NODE_CLASS_MAPPINGS) == {"SolH3Generate", "SolH3Release", "SolH3Extend"}
+ assert (root / module.WEB_DIRECTORY / "timing.js").is_file()
+ from custom_sol_h3.sol_h3_engine import config, bridge
+ assert config.config_path() == root / "config.json"
+diff --git a/tests/test_studio.py b/tests/test_studio.py
+index 44b8424..f1ecfa2 100644
+--- a/tests/test_studio.py
++++ b/tests/test_studio.py
+@@ -11,7 +11,7 @@ import unittest
+ from unittest.mock import patch
+ 
+ from test_bridge import FAKE, ROOT, bridge
+-from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config
++from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config, extend as engine_extend
+ 
+ # Records each request the fake pipeline sees, and writes a worker progress file.
+ RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
+@@ -175,5 +175,186 @@ class StudioGallery(unittest.TestCase):
+             self.assertEqual(comfy_routes.list_gallery(None), {"items": []})
+ 
+ 
++class StudioReferences(unittest.TestCase):
++    """Native IMAGE / AUDIO sockets: a wired reference becomes a file the engine can read."""
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        path = Path(self.temp.name) / "config.json"
++        path.write_text(json.dumps({"profiles": {
++            "FP8": {"precision": "fp8", "label": "Fast", "python": "x", "paths": "y"}}}))
++        self.env = patch.dict(os.environ, {"SOL_ENGINE_CONFIG": str(path)})
++        self.env.start()
++
++    def tearDown(self):
++        self.env.stop()
++        self.temp.cleanup()
++
++    def test_image_batch_becomes_png_files_in_order(self):
++        import numpy as np
++        from PIL import Image
++        batch = np.zeros((2, 8, 6, 3), dtype="float32")
++        batch[0] = 1.0
++        batch[1, 0, 0, :] = 0.5
++        paths = comfy_nodes.materialize_images(batch)
++        self.assertEqual(len(paths), 2)
++        self.assertEqual(Image.open(paths[0]).size, (6, 8))
++        self.assertEqual(Image.open(paths[0]).getpixel((0, 0)), (255, 255, 255))
++        self.assertEqual(Image.open(paths[1]).getpixel((0, 0)), (128, 128, 128))
++
++    def test_audio_becomes_a_readable_wav(self):
++        import numpy as np
++        import wave
++        waveform = np.zeros((1, 2, 800), dtype="float32")
++        waveform[0, 0, :400] = 0.5
++        paths = comfy_nodes.materialize_audio({"waveform": waveform, "sample_rate": 16000})
++        self.assertEqual(len(paths), 1)
++        with wave.open(paths[0]) as handle:
++            self.assertEqual(handle.getframerate(), 16000)
++            self.assertEqual(handle.getnchannels(), 2)
++            self.assertEqual(handle.getnframes(), 800)
++
++    def test_reference_collection_rules(self):
++        import numpy as np
++        batch = np.zeros((1, 4, 4, 3), dtype="float32")
++        # A wired image is collected in reference mode.
++        images, audios = comfy_nodes.collect_references("reference", "", "", batch, ())
++        self.assertEqual(len(images), 1)
++        self.assertEqual(audios, [])
++        # A text take takes no references at all.
++        self.assertEqual(comfy_nodes.collect_references("text", "", "", batch, ()), ([], []))
++        # Audio without an image is refused: the engine needs an image to go with it.
++        slot = {"waveform": np.zeros((1, 1, 4), dtype="float32"), "sample_rate": 16000}
++        with self.assertRaisesRegex(ValueError, "need a reference image"):
++            comfy_nodes.collect_references("reference", "", "", None, (slot,))
++        # Audio with an image is fine -- this is the ref2va extend case.
++        images, audios = comfy_nodes.collect_references("reference", "", "", batch, (slot,))
++        self.assertEqual((len(images), len(audios)), (1, 1))
++
++    def test_reference_records_and_inheritance(self):
++        import tempfile
++        import torch
++        from safetensors.torch import save_file
++        with tempfile.TemporaryDirectory() as temp:
++            image = Path(temp) / "ref.png"
++            image.write_bytes(b"pixels")
++            digest = comfy_nodes._extend.file_digest(str(image))
++            sidecar = Path(temp) / "session.session.safetensors"
++            save_file({"video": torch.zeros((1, 24, 4, 8, 8)), "audio": torch.zeros((2, 32, 4))},
++                      str(sidecar), metadata={
++                          "format": "solx-v1",
++                          "references": json.dumps([{"kind": "image", "path": str(image),
++                                                    "sha256": digest}])})
++            # The take's own references come back, verified.
++            images, audios = comfy_nodes.inherited_references(str(sidecar))
++            self.assertEqual(images, [str(image)])
++            self.assertEqual(audios, [])
++            # A file that changed under the chain is refused by name, not swapped.
++            image.write_bytes(b"other pixels")
++            with self.assertRaisesRegex(ValueError, "has changed since"):
++                comfy_nodes.inherited_references(str(sidecar))
++            # A missing file is refused too.
++            image.unlink()
++            with self.assertRaisesRegex(ValueError, "never rebuilds its conditioning"):
++                comfy_nodes.inherited_references(str(sidecar))
++
++    def test_extend_takes_wired_references(self):
++        import numpy as np
++        # The Extend node routes a wired reference into the engine's reference mode.
++        node = comfy_nodes.SolH3Extend()
++        self.assertIn("image_input", comfy_nodes.SolH3Extend.INPUT_TYPES()["optional"])
++        self.assertIn("audio_1", comfy_nodes.SolH3Extend.INPUT_TYPES()["optional"])
++        images, _ = comfy_nodes.collect_references(
++            "reference", "", "", np.zeros((1, 4, 4, 3), dtype="float32"), ())
++        self.assertEqual("reference" if images else "text", "reference")
++
++    def test_image_rules_use_the_resolved_count(self):
++        node = comfy_nodes.SolH3Generate()
++        with self.assertRaisesRegex(ValueError, "does not support reference-image mode"):
++            node.generate("FP8", "a scene", 1, mode="reference")
++        with self.assertRaisesRegex(ValueError, "Upload an image for reference-image mode"):
++            comfy_nodes.check_images("reference", 0)
++        with self.assertRaisesRegex(ValueError, "exactly one image"):
++            comfy_nodes.check_images("first_frame", 2)
++        self.assertIsNone(comfy_nodes.check_images("reference", 1))
++        self.assertIsNone(comfy_nodes.check_images("text", 0))
++
++
++class FrozenConditioning(unittest.TestCase):
++    """A take's conditioning is frozen into its own directory: an artifact, not a recipe."""
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.root = Path(self.temp.name)
++        self.source = self.root / "source.png"
++        self.source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
++        self.audio = self.root / "voice.wav"
++        self.audio.write_bytes(b"RIFF" + b"sound")
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def test_freeze_copies_the_media_next_to_the_take(self):
++        take = self.root / "request-00001"
++        records = engine_extend.freeze_references(take, [self.source], [self.audio])
++        self.assertEqual([r["kind"] for r in records], ["image", "audio"])
++        for record in records:
++            frozen = Path(record["path"])
++            self.assertTrue(frozen.is_file())
++            self.assertEqual(frozen.parent, take / "refs")
++            self.assertEqual(frozen.read_bytes(), Path(record["source"]).read_bytes())
++            self.assertEqual(record["sha256"], engine_extend.file_digest(str(frozen)))
++        self.assertEqual((take / "refs" / "ref_01.png").name, "ref_01.png")
++        self.assertEqual((take / "refs" / "audio_01.wav").name, "audio_01.wav")
++
++    def test_a_take_inherits_the_frozen_copy_not_the_source(self):
++        take = self.root / "request-00001"
++        records = engine_extend.freeze_references(take, [self.source], [])
++        # The source is gone (input folder cleared): the chain still holds its copy.
++        self.source.unlink()
++        session = take / "session.session.safetensors"
++        from safetensors.torch import save_file
++        save_file({"video": torch_zeros(), "audio": torch_zeros()},
++                  str(session),
++                  metadata={"format": engine_extend.SESSION_FORMAT,
++                            "references": json.dumps(records)})
++        images, audios = comfy_nodes.inherited_references(str(session))
++        self.assertEqual(len(images), 1)
++        self.assertEqual(audios, [])
++        self.assertTrue(Path(images[0]).is_file())
++        self.assertEqual(Path(images[0]).parent, take / "refs")
++
++    def test_a_missing_artifact_is_refused_by_name(self):
++        take = self.root / "request-00001"
++        records = engine_extend.freeze_references(take, [self.source], [])
++        Path(records[0]["path"]).unlink()
++        session = take / "session.session.safetensors"
++        from safetensors.torch import save_file
++        save_file({"video": torch_zeros(), "audio": torch_zeros()},
++                  str(session),
++                  metadata={"format": engine_extend.SESSION_FORMAT,
++                            "references": json.dumps(records)})
++        with self.assertRaisesRegex(ValueError, "never rebuilds its conditioning"):
++            comfy_nodes.inherited_references(str(session))
++
++    def test_a_changed_artifact_is_refused_by_name(self):
++        take = self.root / "request-00001"
++        records = engine_extend.freeze_references(take, [self.source], [])
++        Path(records[0]["path"]).write_bytes(b"tampered")
++        session = take / "session.session.safetensors"
++        from safetensors.torch import save_file
++        save_file({"video": torch_zeros(), "audio": torch_zeros()},
++                  str(session),
++                  metadata={"format": engine_extend.SESSION_FORMAT,
++                            "references": json.dumps(records)})
++        with self.assertRaisesRegex(ValueError, "has changed since"):
++            comfy_nodes.inherited_references(str(session))
++
++
++def torch_zeros():
++    import torch
++    return torch.zeros((1, 24, 1, 4, 4))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/web/studio.css b/web/studio.css
+index b51353e..912dedd 100644
+--- a/web/studio.css
++++ b/web/studio.css
+@@ -92,6 +92,11 @@
+ .sh-seed input{width:100%;height:38px;padding:0 12px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);font-variant-numeric:tabular-nums;outline:none}
+ .sh-seed input:focus{border-color:var(--sh-accent-line)}
+ .sh-seed input:disabled{color:var(--sh-faint)}
++.sh-text{width:100%;height:38px;padding:0 12px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);outline:none}
++.sh-text:focus{border-color:var(--sh-accent-line)}
++.sh-text::placeholder{color:var(--sh-faint)}
++.sh-select{width:100%;height:38px;padding:0 10px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);outline:none}
++.sh-select:focus{border-color:var(--sh-accent-line)}
+ .sh-seed .sh-icon-button{border-color:var(--sh-border);background:var(--sh-card);width:38px;height:38px}
+ 
+ /* Chips (format). */
+@@ -246,3 +251,8 @@
+   background:rgba(16,19,23,.92);backdrop-filter:blur(10px);border:1px solid var(--sh-border);box-shadow:0 12px 32px rgba(0,0,0,.4);color:var(--sh-ink)}
+ .sh-pill .sh-wordmark img{width:22px;height:22px}.sh-pill .sh-wordmark b{font-size:14px}
+ .sh-pill .sh-switch-item{min-width:68px;height:28px}
++
++.sh-audio-chip{position:relative;display:inline-flex;align-items:center;gap:6px;padding:4px 8px;margin:4px 6px 0 0;border-radius:8px;background:var(--color-background-secondary,#f1efe8);font-size:12px;line-height:18px}
++.sh-audio-remove{display:grid;place-items:center;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:rgba(10,12,15,.78);color:#fff;cursor:pointer;flex:none}
++.sh-audio-remove .sh-icon{width:11px;height:11px}
++.sh-audio-remove:hover{background:#c0392b}
+diff --git a/web/studio.js b/web/studio.js
+index a5f3b5b..c4b300e 100644
+--- a/web/studio.js
++++ b/web/studio.js
+@@ -45,9 +45,10 @@ const isVideo = name => /\.(mp4|webm|mov|mkv)$/i.test(name || '');
+ const MODES = [
+     ['text', () => t('Text', '文生视频'), () => t('Prompt only', '仅提示词')],
+     ['first_frame', () => t('First frame', '首帧'), () => t('Animate an image', '让图片动起来')],
+-    ['reference', () => t('Reference', '参考图'), () => t('Up to 4 images', '最多 4 张')],
++    ['reference', () => t('Reference', '参考图'), () => t('Up to 9 images · 3 audios', '最多 9 张图 · 3 段音频')],
++    ['extend', () => t('Extend', '续接'), () => t('Continue the last take', '续接最新一条')],
+ ];
+-const MODE_NAME = { first_frame: () => t('first frame', '首帧'), reference: () => t('reference images', '参考图') };
++const MODE_NAME = { first_frame: () => t('first frame', '首帧'), reference: () => t('reference images', '参考图'), extend: () => t('extend', '续接') };
+ const RESOLUTIONS = ['768p', '480p'];
+ const CANVAS = { '768p': '1344 × 768', '480p': '864 × 480' };
+ const PIPELINES = {
+@@ -178,11 +179,12 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             b.setAttribute('role', 'radio');
+             b.onclick = () => {
+                 if (b.dataset.unsupported === 'true') return;
+-                mode = id; set(node, 'mode', id); renderMode(); update();
++                mode = id; if (id !== 'extend') set(node, 'mode', id); renderMode(); savePath(); update();
+             };
+             modeRow.append(b);
+         }
+         let images = String(value(node, 'image', '') || '').split(',').map(s => s.trim()).filter(Boolean);
++        let audios = String(value(node, 'audio', '') || '').split(',').map(s => s.trim()).filter(Boolean);
+         const drop = el('div', 'sh-drop'), file = el('input'); file.type = 'file'; file.accept = 'image/*'; file.hidden = true;
+         const dropEmpty = el('button', 'sh-drop-empty'); dropEmpty.type = 'button';
+         const dropTitle = el('strong'), dropHint = el('small', null, t('PNG, JPG or WebP · stored in ComfyUI input', 'PNG、JPG 或 WebP · 存入 ComfyUI input'));
+@@ -191,20 +193,94 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+         const thumbs = el('div', 'sh-thumbs');
+         const uploadNote = el('p', 'sh-note');
+         drop.append(dropEmpty, thumbs, file);
+-        modeSection.append(modeRow, drop, uploadNote);
+-        const limit = () => mode === 'first_frame' ? 1 : 4;
++        const audioDrop = el('div', 'sh-drop sh-drop-audio');
++        const audioDropEmpty = el('button', 'sh-drop-empty'); audioDropEmpty.type = 'button';
++        const audioDropTitle = el('strong', null, t('Audio references', '音频参考'));
++        const audioDropHint = el('small', null, t('MP3, WAV or M4A · up to 3 · voice or music · numbered by upload order', 'MP3、WAV 或 M4A · 最多 3 段 · 人声或音乐 · 按上传顺序编号'));
++        audioDropEmpty.append(icon('upload'), audioDropTitle, audioDropHint);
++        audioDropEmpty.onclick = () => audioFile.click();
++        const audioThumbs = el('div', 'sh-thumbs');
++        const audioFile = el('input'); audioFile.type = 'file'; audioFile.accept = 'audio/*'; audioFile.hidden = true; audioFile.multiple = true;
++        audioDrop.append(audioDropEmpty, audioThumbs, audioFile);
++        modeSection.append(modeRow, drop, audioDrop, uploadNote);
++        const extendLabel = el('span', 'sh-field-label', t('Pin window', '续接窗口'));
++        const extendRow = el('div', 'sh-chips'); extendRow.setAttribute('role', 'radiogroup');
++        const extendNote = el('p', 'sh-note');
++        modeSection.append(extendLabel, extendRow, extendNote);
++        const WINDOWS = [39, 90, 56, 22, 5];
++        let windowFrames = Number(value(node, 'window_frames', 39)) || 39;
++        function renderWindows() {
++            extendRow.replaceChildren();
++            for (const n of WINDOWS) {
++                const b = button('', 'sh-chip'); b.dataset.id = String(n); b.append(el('span', null, String(n)));
++                b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', String(n === windowFrames));
++                b.disabled = mode !== 'extend';
++                b.title = (n === 39 || n === 90) ? t('Recommended (shared AV grid)', '推荐（共享音视频网格）') : '';
++                b.onclick = () => { windowFrames = n; renderWindows(); };
++                extendRow.append(b);
++            }
++            extendLabel.hidden = mode !== 'extend';
++            extendRow.hidden = mode !== 'extend';
++            extendNote.hidden = mode !== 'extend';
++            if (mode === 'extend') extendNote.textContent = t('Pins the last ', '钉入所选片段的尾部 ') + windowFrames + t(' frames as context', ' 帧作为上下文');
++        }
++        // Which take to continue: the same choice the node graph makes by wiring a
++        // session output into the Extend node's session input.
++        const sourceLabel = el('span', 'sh-field-label', t('Continue from', '续接来源'));
++        const sourceSelect = el('select', 'sh-select');
++        const sourceNote = el('p', 'sh-note');
++        modeSection.append(sourceLabel, sourceSelect, sourceNote);
++        let sessionItems = [], selectedSession = '', lastSession = '';
++        const sessionLabel = item => {
++            const when = item.created ? new Date(item.created * 1000).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en') : '';
++            const name = item.output ? item.output.split('/').pop().replace(/\.mp4$/i, '') : '';
++            const what = item.mode && MODE_NAME[item.mode] ? MODE_NAME[item.mode]() : t('take', '片段');
++            return [name || what, when].filter(Boolean).join(' · ');
++        };
++        function renderSessions() {
++            sourceSelect.replaceChildren();
++            if (!sessionItems.length) {
++                const empty = el('option', null, t('No take to continue yet', '还没有可续接的片段'));
++                empty.value = ''; sourceSelect.append(empty);
++            }
++            for (const item of sessionItems) {
++                const option = el('option', null, sessionLabel(item));
++                option.value = item.session;
++                sourceSelect.append(option);
++            }
++            if (selectedSession && !sessionItems.some(item => item.session === selectedSession)) selectedSession = '';
++            if (!selectedSession && lastSession && sessionItems.some(item => item.session === lastSession)) selectedSession = lastSession;
++            if (!selectedSession && sessionItems.length) selectedSession = sessionItems[0].session;
++            sourceSelect.value = selectedSession;
++            sourceSelect.onchange = () => { selectedSession = sourceSelect.value; renderSessionNote(); };
++            renderSessionNote();
++        }
++        function renderSessionNote() {
++            const item = sessionItems.find(entry => entry.session === selectedSession);
++            sourceNote.textContent = item
++                ? (item.prompt ? item.prompt.slice(0, 140) : t('This take', '这一段'))
++                : t('Generate a video first, then pick the take to continue.', '请先生成一条视频，再选择要续接的片段。');
++        }
++        async function refreshSessions() {
++            try { sessionItems = (await json('/solh3/sessions?limit=40')).items || []; }
++            catch { sessionItems = []; }
++            renderSessions();
++        }
++        const limit = () => mode === 'first_frame' ? 1 : 9;
+         const inputName = name => { const split = name.lastIndexOf('/'); return [name.slice(split + 1), split < 0 ? '' : name.slice(0, split)]; };
+         function renderImages() {
+             thumbs.replaceChildren();
+-            for (const name of images) {
++            images.forEach((name, index) => {
+                 const tile = el('figure', 'sh-thumb'), img = el('img');
+                 const [leaf, folder] = inputName(name);
+                 img.src = view(leaf, folder, 'input');
+                 img.alt = name; img.loading = 'lazy';
++                const badge = el('span', 'sh-thumb-badge', t('Image ', '图') + (index + 1));
++                badge.style.cssText = 'position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:6px;background:rgba(12,68,124,.85);color:#fff;font-size:11px;line-height:16px';
+                 const remove = button('', 'sh-thumb-remove', () => { images = images.filter(n => n !== name); saveImages(); });
+                 remove.append(icon('close')); remove.setAttribute('aria-label', t('Remove', '移除'));
+-                tile.append(img, remove); thumbs.append(tile);
+-            }
++                tile.append(badge, img, remove); thumbs.append(tile);
++            });
+             if (images.length && images.length < limit()) {
+                 const add = button('', 'sh-thumb sh-thumb-add', () => file.click());
+                 add.append(icon('plus')); add.setAttribute('aria-label', t('Add image', '添加图片'));
+@@ -212,9 +288,24 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             }
+             dropEmpty.hidden = images.length > 0;
+             thumbs.hidden = images.length === 0;
+-            file.multiple = mode === 'reference';
++            file.multiple = mode !== 'first_frame';
++            if (audioThumbs) {
++                audioThumbs.replaceChildren();
++                audios.forEach((name, index) => {
++                    const chip = el('span', 'sh-note sh-audio-chip');
++                    chip.textContent = '♪ ' + t('Audio ', '音') + (index + 1) + ' · ' + inputName(name)[0];
++                    const remove = button('', 'sh-audio-remove', () => { audios = audios.filter(n => n !== name); saveAudios(); });
++                    remove.append(icon('close')); remove.setAttribute('aria-label', t('Remove audio', '移除音频'));
++                    remove.title = t('Remove audio', '移除音频');
++                    chip.append(remove);
++                    audioThumbs.append(chip);
++                });
++                audioDropEmpty.hidden = audios.length > 0;
++                audioThumbs.hidden = audios.length === 0;
++            }
+         }
+         function saveImages() { images = images.slice(0, limit()); set(node, 'image', images.join(',')); renderImages(); update(); }
++        function saveAudios() { audios = audios.slice(0, 3); set(node, 'audio', audios.join(',')); renderImages(); update(); }
+         async function uploadFiles(files) {
+             const names = [];
+             for (const f of files) {
+@@ -228,11 +319,17 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+         }
+         async function upload(files) {
+             const wanted = [...files].filter(f => f.type.startsWith('image/')).slice(0, limit() - (mode === 'first_frame' ? 0 : images.length));
+-            if (!wanted.length) return;
++            const audioWanted = (mode === 'reference' || mode === 'extend') ? [...files].filter(f => f.type.startsWith('audio/')).slice(0, 3 - audios.length) : [];
++            if (!wanted.length && !audioWanted.length) return;
+             drop.dataset.busy = 'true'; uploadNote.textContent = t('Uploading…', '上传中…'); uploadNote.dataset.error = 'false';
+             try {
+                 const names = await uploadFiles(wanted);
+                 images = mode === 'first_frame' ? names : [...images, ...names];
++                if (audioWanted.length) {
++                    const anames = await uploadFiles(audioWanted);
++                    audios = [...audios, ...anames];
++                    saveAudios();
++                }
+                 uploadNote.textContent = '';
+                 saveImages();
+             } catch (error) {
+@@ -240,17 +337,26 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             } finally { drop.dataset.busy = 'false'; file.value = ''; }
+         }
+         file.onchange = () => upload(file.files);
++        audioFile.onchange = () => upload(audioFile.files);
++        audioDrop.hidden = mode !== 'reference' && mode !== 'extend';
+         for (const name of ['dragenter', 'dragover']) drop.addEventListener(name, e => { e.preventDefault(); drop.dataset.over = 'true'; });
+         for (const name of ['dragleave', 'drop']) drop.addEventListener(name, () => { drop.dataset.over = 'false'; });
+         drop.addEventListener('drop', e => { e.preventDefault(); upload(e.dataTransfer?.files || []); });
+         function renderMode() {
+             for (const b of modeRow.children) b.setAttribute('aria-checked', String(b.dataset.id === mode));
++            // Extend can carry its own references: the new take may be a different scene.
+             drop.hidden = mode === 'text';
+-            dropTitle.textContent = mode === 'reference' ? t('Drop up to 4 images or click to upload', '拖入最多 4 张图片或点击上传')
++            if (audioDrop) audioDrop.hidden = mode !== 'reference' && mode !== 'extend';
++            if (typeof renderWindows === 'function') renderWindows();
++            sourceLabel.hidden = mode !== 'extend';
++            sourceSelect.hidden = mode !== 'extend';
++            sourceNote.hidden = mode !== 'extend';
++            dropTitle.textContent = mode === 'reference' ? t('Drop up to 9 images, or click to upload', '拖入最多 9 张图片，或点击上传')
+                 : t('Drop an image or click to upload', '拖入图片或点击上传');
+             if (mode === 'first_frame' && images.length > 1) saveImages();
+             uploadNote.textContent = mode === 'reference' ? t('Subjects, characters or style to carry into the video.', '要带入视频的主体、角色或风格。')
+-                : mode === 'first_frame' ? t('The video starts from this frame.', '视频从这张图开始。') : '';
++                : mode === 'first_frame' ? t('The video starts from this frame.', '视频从这张图开始。')
++                : mode === 'extend' ? t('Optional: references for THIS segment. Leave empty to inherit the take it continues.', '可选：这一段自己的参考素材；留空则继承所续接那一段的参考。') : '';
+             uploadNote.dataset.error = 'false';
+             renderImages();
+         }
+@@ -337,6 +443,37 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+         seedRow.append(seedChips, seedInput, dice);
+         seedSection.append(seedRow);
+ 
++        // Save target: folder + file name. Empty means the node's readable default.
++        const saveSection = section(t('Save to', '保存位置'));
++        const saveGrid = el('div', 'sh-format');
++        const dirBlock = el('div', 'sh-field'), nameBlock = el('div', 'sh-field');
++        const dirInput = el('input', 'sh-text'); dirInput.type = 'text';
++        dirInput.placeholder = t('SolH3/text', 'SolH3/text');
++        dirInput.value = String(value(node, 'output_dir', '') || '');
++        dirInput.setAttribute('aria-label', t('Save folder', '保存目录'));
++        const nameInput = el('input', 'sh-text'); nameInput.type = 'text';
++        nameInput.placeholder = t('auto', '自动');
++        nameInput.value = String(value(node, 'filename', '') || '');
++        nameInput.setAttribute('aria-label', t('File name', '文件名'));
++        dirBlock.append(el('span', 'sh-field-label', t('Folder', '目录')), dirInput);
++        nameBlock.append(el('span', 'sh-field-label', t('File name', '文件名')), nameInput);
++        saveGrid.append(dirBlock, nameBlock);
++        const saveNote = el('p', 'sh-note');
++        saveSection.append(saveGrid, saveNote);
++        const savePath = () => {
++            const folder = dirInput.value.trim() || `SolH3/${mode === 'extend' ? 'extend' : mode}`;
++            const name = nameInput.value.trim() || t('auto', 'auto');
++            saveNote.textContent = t('Saves to ', '将保存到 ') + folder + '/' + name + '.mp4'
++                + (nameInput.value.trim() ? '' : t('  (auto-named)', '（自动命名）'));
++        };
++        const syncSave = () => {
++            set(node, 'output_dir', dirInput.value.trim());
++            set(node, 'filename', nameInput.value.trim());
++            savePath(); update();
++        };
++        dirInput.addEventListener('change', syncSave);
++        nameInput.addEventListener('change', syncSave);
++
+         // Footer: Generate.
+         const generate = button('', 'sh-generate');
+         const generateLabel = el('span', null, t('Generate', '生成'));
+@@ -390,15 +527,19 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+ 
+         // ---- State.
+         let promptId = null, settled = false, running = false, submitting = false, last = null, tick = null;
++        // A reference wired in the node graph counts as an image source as well.
++        const linked = name => Boolean(node.inputs?.find(entry => entry.name === name)?.link);
+         function blocked() {
+             if (running || submitting) return t('Generating…', '生成中…');
+             if (!prompt.value.trim()) return t('Describe your scene to start.', '先描述你的画面。');
+             const p = profile();
+             if (!p || /SOL_ENGINE_CONFIG/.test(p.name)) return t('Configure a Sol-H3 profile first (config.json).', '请先配置 Sol-H3 profile（config.json）。');
+-            if (mode !== 'text' && !p.modes.includes(mode))
++            if (mode !== 'text' && mode !== 'extend' && !p.modes.includes(mode))
+                 return t(`Switch pipeline to use ${MODE_NAME[mode]()}.`, `切换流程以使用${MODE_NAME[mode]()}模式。`);
+-            if (mode !== 'text' && !images.length) return mode === 'first_frame'
++            if (mode !== 'text' && mode !== 'extend' && !images.length && !linked('image_input')) return mode === 'first_frame'
+                 ? t('Upload a first-frame image.', '请上传首帧图片。') : t('Upload at least one reference image.', '请至少上传一张参考图。');
++            if (mode === 'extend' && audios.length && !images.length && !linked('image_input'))
++                return t('Reference audio needs a reference image.', '参考音频需要配一张参考图。');
+             return '';
+         }
+         function update() {
+@@ -409,7 +550,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             reason.textContent = why && !(running || submitting) ? why : '';
+             const p = profile();
+             for (const b of modeRow.children) {
+-                const supported = b.dataset.id === 'text' || Boolean(p?.modes.includes(b.dataset.id));
++                const supported = b.dataset.id === 'text' || b.dataset.id === 'extend' || Boolean(p?.modes.includes(b.dataset.id));
+                 b.dataset.unsupported = String(!supported);
+                 b.setAttribute('aria-disabled', String(!supported));
+                 const other = profiles.find(q => q.modes.includes(b.dataset.id));
+@@ -485,6 +626,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             if (!promptId || prompt_id !== promptId) return;
+             if (String(id) === String(node.id) && out?.text?.[0]) {
+                 try { pendingTiming = JSON.parse(out.text[0]); } catch { pendingTiming = null; }
++                // The report carries this take's session sidecar: the next extend picks it up.
++                if (pendingTiming?.session) lastSession = pendingTiming.session;
+             }
+             const files = [...(out?.images || []), ...(out?.videos || []), ...(out?.gifs || []), ...(out?.solh3_video || [])]
+                 .filter(f => isVideo(f.filename));
+@@ -493,7 +636,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+                 const f = files[0];
+                 showVideo({ file: f.filename, subfolder: f.subfolder, type: f.type, e2e_s: pendingTiming?.e2e_s,
+                     profile: pendingTiming?.profile, seed: pendingTiming?.seed ?? value(node, 'seed') });
+-                update(); refreshRecent();
++                update(); refreshRecent(); refreshSessions();
+             }
+         };
+         const onError = e => {
+@@ -522,10 +665,41 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+                 // Studio owns the seed; ComfyUI's after-generate control would change it twice.
+                 const control = widget(node, 'control_after_generate') || widget(node, 'seed')?.linkedWidgets?.[0];
+                 if (control) control.value = 'fixed';
+-                set(node, 'prompt', prompt.value); set(node, 'mode', mode); set(node, 'image', mode === 'text' ? '' : images.join(','));
++                set(node, 'prompt', prompt.value);
++                if (mode !== 'extend') set(node, 'mode', mode);
++                set(node, 'image', mode === 'text' ? '' : images.join(','));
++                set(node, 'audio', (mode === 'reference' || mode === 'extend') ? audios.join(',') : '');
+                 set(node, 'backend', 'local'); set(node, 'resolution', resolution);
++                set(node, 'output_dir', dirInput.value.trim());
++                set(node, 'filename', nameInput.value.trim());
+                 renderTimeline();
+                 const snapshot = await app.graphToPrompt();
++                if (mode === 'extend') {
++                    // Studio "Extend" routes through the dedicated SolH3Extend node
++                    // (Generate no longer carries extend fields). The session is the
++                    // chosen take's sidecar, exactly like wiring a session output in
++                    // the node graph; empty falls back to the newest take.
++                    const id = Object.keys(snapshot.prompt).find(key => snapshot.prompt[key].class_type === 'SolH3Generate')
++                        || Object.keys(snapshot.prompt)[0];
++                    const g = snapshot.prompt[id];
++                    const keep = widget(node, 'keep_loaded')?.value ?? true;
++                    snapshot.prompt[id] = {
++                        class_type: 'SolH3Extend',
++                        inputs: {
++                            profile: String(g.inputs.profile),
++                            prompt: String(g.inputs.prompt),
++                            seed: Number(g.inputs.seed),
++                            session: selectedSession || '',
++                            window_frames: Number(windowFrames) || 39,
++                            keep_loaded: keep,
++                            resolution: String(g.inputs.resolution),
++                            image: String(g.inputs.image ?? ''),
++                            audio: String(g.inputs.audio ?? ''),
++                            output_dir: String(g.inputs.output_dir ?? dirInput.value.trim()),
++                            filename: String(g.inputs.filename ?? nameInput.value.trim()),
++                        },
++                    };
++                }
+                 const reply = await api.queuePrompt(0, snapshot);
+                 if (!reply?.prompt_id) throw new Error(t('ComfyUI did not accept the request.', 'ComfyUI 未接受该请求。'));
+                 promptId = reply.prompt_id; settled = false; pendingTiming = null;
+@@ -648,8 +822,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+                     const blob = await (await fetch(galleryURL(item.image))).blob();
+                     images = await uploadFiles([new File([blob], item.image, { type: blob.type || 'image/png' })]);
+                     mode = wanted;
+-                } catch { mode = 'text'; images = []; }
+-            } else { mode = 'text'; images = []; }
++                } catch { mode = 'text'; images = []; audios = []; }
++            } else { mode = 'text'; images = []; audios = []; }
+             set(node, 'mode', mode); set(node, 'image', images.join(','));
+             renderPipelines(); renderMode(); renderFormat(); update();
+             showTab('studio');
+@@ -692,8 +866,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
+             dialog.remove();
+             if (current?.dialog === dialog) current = null;
+         });
+-        renderPipelines(); renderMode(); renderFormat(); renderTimeline(); syncPrompt();
+-        refreshRecent(); poll();
++        renderPipelines(); renderMode(); renderFormat(); renderWindows(); renderTimeline(); syncPrompt(); savePath();
++        refreshRecent(); refreshSessions(); poll();
+         document.body.append(dialog); dialog.showModal();
+         showTab(tab);
+         requestAnimationFrame(() => (tab === 'studio' ? prompt : galleryTab).focus({ preventScroll: true, focusVisible: false }));

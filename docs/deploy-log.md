@@ -43,3 +43,39 @@
 9. torchaudio 与 torch 2.13 无匹配轮子 → 用 PyAV AudioResampler 替代。
 10. `pkill -f` 模式会匹配到自己（命令串含脚本名）→ 用 `[x]` 括号技巧或分步执行。
 11. AdaLN 表 key 是精确浮点比较；改 schedule/LoRA/参考规则后必须重跑补表。
+
+## 2026-10-25 追加：引擎扩展补丁化（setup 的第 4 步）
+
+### 发现的缺口
+`setup.sh` 原本**从不克隆引擎，也从不把我们的扩展打上去**：它直接 `cd` 进
+`/root/Sana/models/minimax_h3/Sol-H3-ComfyUI` 用人家的 `scripts/hyperflow/*.py` 构建 FP8，
+再把这个目录软链进 ComfyUI。而引擎本体是上游 NVlabs/Sana 的一部分——照 README 装完的人
+拿到的是**上游原版引擎**：Studio 的「续接来源」下拉没了、节点图的参考素材口没了、
+`output_dir`/`filename` 也没了，等于我们的扩展全部失效，而且**不报任何错**。
+
+### 做法
+我们的改动一直落在 `/root/Sana` 这个克隆的**工作区**里（未提交），所以它天然就是一份 diff：
+
+```bash
+cd /root/Sana
+git add -N models/minimax_h3/Sol-H3-ComfyUI/sol_h3_engine/extend.py   # 新增文件也要进 diff
+git diff --relative=models/minimax_h3/Sol-H3-ComfyUI -- models/minimax_h3/Sol-H3-ComfyUI \
+  > setup/patches/0001-sol-h3-engine-extensions.patch
+```
+
+- `setup/get-engine.sh`：取上游引擎（浅克隆 NVlabs/Sana，数百 MB）
+- `setup/apply-engine-patches.sh`：**备份 → 打补丁 → 校验**，幂等，`--revert` 可还原
+- `setup/patches/orig/hyperflow_worker.py.orig`：上游原始 `hyperflow_worker.py` 备份
+- `setup.sh` 新增第 4 步（**在 FP8 构建之前**——构建脚本本身也在补丁里）
+
+### 关键教训
+12. **「装了仓库」不等于「引擎可用」**：只要引擎本体来自上游，就必须有一条 setup 步骤
+    负责把扩展落上去；否则失败是**静默**的（功能缺失，不报错）。
+13. 补丁必须在**构建之前**打：`scripts/hyperflow/convert_ref.py` 也在补丁里（AHEAD 2→1），
+    晚打一步，FP8 参考图 DiT 就用错行偏移构建。
+14. 补丁要先试打再落盘（`patch --dry-run`），对不上就**报错停下**——不能硬打，
+    更不能留一个半打的状态。反向试打能过 = 已经打过 = 幂等跳过。
+15. 校验标记要用**只有我们才有**的字符串：`output_dir` 会命中上游的
+    `get_output_directory()`，还原后误报"标记仍在"。
+16. `git diff --relative=<dir>` 让补丁路径相对引擎目录，`patch -p1` 直接可用；
+    新增文件要先 `git add -N`（intent-to-add）才会进 diff。

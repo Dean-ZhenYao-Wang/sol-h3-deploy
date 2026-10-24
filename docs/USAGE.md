@@ -20,6 +20,25 @@ http://<服务器IP>:8188
 
 停止：在运行终端按 `Ctrl+C`（或 `pkill -f "main.py"`）。
 
+## 引擎本体与扩展补丁
+
+引擎本体来自上游 [NVlabs/Sana](https://github.com/NVlabs/Sana) 的
+`models/minimax_h3/Sol-H3-ComfyUI`；本仓库对它的全部扩展（续接 Extend、参考素材原生插槽、
+保存目录/文件名、条件冻结成产物、作品库对齐、Studio 续接来源选择器）以**补丁**形式放在
+`setup/patches/`，由 `setup/apply-engine-patches.sh` 打上去。
+
+```bash
+bash setup/get-engine.sh                     # 取上游引擎（还没取的话）
+bash setup/apply-engine-patches.sh           # 备份 → 打补丁 → 校验（幂等）
+bash setup/apply-engine-patches.sh --revert  # 还原回上游版本
+```
+
+- 每个被改动的文件都会先备份成 `<文件>.bak-<时间戳>`；上游原始的 `hyperflow_worker.py`
+  另存于 `setup/patches/orig/hyperflow_worker.py.orig`
+- 补丁对不上（上游更新过）时脚本**报错停下**，不会硬打；此时可用本仓库
+  `engine/Sol-H3-ComfyUI/`（打过补丁的完整引擎，4.7M）直接覆盖引擎目录
+- `setup.sh` 的第 4 步自动完成这两件事，且在 FP8 构建**之前**（构建脚本本身也在补丁里）
+
 ## 功能总览
 
 ComfyUI 里有三个使用入口：

@@ -4,17 +4,22 @@
 #   --skip-weights  已有 /model 或已下载权重，跳过下载
 #   --skip-build    已有构建好的 FP8 权重，跳过 FP8 构建（数小时）
 #   --skip-comfyui  ComfyUI 已就绪，跳过安装
+#
+# 步骤 4 会取一份上游引擎（NVlabs/Sana）并把本仓库的扩展补丁打上去——
+# 引擎本体是上游的，我们的续接 / 参考素材口 / 保存位置等改动都在补丁里。
 set -e
 
 ROOT=${ROOT:-/root}
 MODEL_DIR=${MODEL_DIR:-/model/ModelScope}
 H3=${MODEL_DIR}/MiniMax/MiniMax-H3
 CONFIG=${CONFIG:-/root/sol-h3-settings-final/config.json}
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE_DIR="$ROOT/Sana/models/minimax_h3/Sol-H3-ComfyUI"
 
 step() { echo -e "\n\033[1;36m==> $1\033[0m"; }
 
 # ---------- 1. Python 环境 ----------
-step "1/7 Python 环境（conda py312 + torch 2.13 cu132）"
+step "1/8 Python 环境（conda py312 + torch 2.13 cu132）"
 if [ ! -d "$ROOT/h3_runtime_venv" ]; then
   conda create -y -n py312 python=3.12
   /usr/local/miniconda3/envs/py312/bin/python -m venv --system-site-packages "$ROOT/h3_runtime_venv"
@@ -25,7 +30,7 @@ $PY -m pip install torch==2.13.0 triton==3.7.1 av scipy safetensors \
   transformers diffusers accelerate modelscope soundfile  # torch/triton 走 https://download.pytorch.org/whl/cu132
 
 # ---------- 2. 编译 SageAttention 2.2 + Sol-Attn 0.5 ----------
-step "2/7 编译 SageAttention 2.2.0（PyPI 只有 1.0.6，必须源码）"
+step "2/8 编译 SageAttention 2.2.0（PyPI 只有 1.0.6，必须源码）"
 apt-get update && apt-get install -y g++ aria2 git
 if ! $PY -c "import sageattention" 2>/dev/null; then
   cd "$ROOT"
@@ -34,7 +39,7 @@ if ! $PY -c "import sageattention" 2>/dev/null; then
   TORCH_CUDA_ARCH_LIST="12.0" CUDA_HOME=/usr/local/cuda-13.2 $PY -m pip install -e .
   cd "$ROOT" && rm -rf SageAttention
 fi
-step "2b/7 编译 Sol-Attn 0.5.0（NVlabs/Sana@9bfca5c4 的 techniques/sparse_backends）"
+step "2b/8 编译 Sol-Attn 0.5.0（NVlabs/Sana@9bfca5c4 的 techniques/sparse_backends）"
 if ! $PY -c "import sol_attn" 2>/dev/null; then
   cd "$ROOT"
   git clone https://github.com/NVlabs/Sana sana-src && cd sana-src
@@ -45,7 +50,7 @@ fi
 
 # ---------- 3. 下载权重 ----------
 if [ "$1" != "--skip-weights" ]; then
-step "3/7 下载权重（约 75GB，/model 网络盘极快；无 /model 时走 ModelScope）"
+step "3/8 下载权重（约 75GB，/model 网络盘极快；无 /model 时走 ModelScope）"
   $PY -m pip install -U modelscope
   $PY -m modelscope download --model MiniMax/MiniMax-H3 --local_dir "$H3"
   $PY -m modelscope download --model videorebirth/hyperflow --local_dir "$ROOT/hyperflow-dl"
@@ -53,9 +58,16 @@ step "3/7 下载权重（约 75GB，/model 网络盘极快；无 /model 时走 M
   $PY -m modelscope download --model Efficient-Large-Model/Sol-H3-VAE --local_dir "$ROOT/sol-h3-vae"
 fi
 
-# ---------- 4. 构建 FP8 ----------
+# ---------- 4. 引擎 + 引擎扩展补丁 ----------
+# 上游引擎在 NVlabs/Sana 里；本仓库对它的扩展以补丁形式跟着仓库走。
+# 必须在 FP8 构建之前：构建脚本 scripts/hyperflow/convert_ref.py 也在补丁里。
+step "4/8 取引擎（NVlabs/Sana）并打上本仓库的扩展补丁"
+bash "$REPO_DIR/setup/get-engine.sh" "$ROOT/Sana"
+bash "$REPO_DIR/setup/apply-engine-patches.sh" "$ENGINE_DIR"
+
+# ---------- 5. 构建 FP8 ----------
 if [ "$1" != "--skip-build" ]; then
-step "4/7 构建 FP8 权重（数小时；顺序不能乱：不带 drop-adaln → 建表 → 合并 → 再 drop）"
+step "5/8 构建 FP8 权重（数小时；顺序不能乱：不带 drop-adaln → 建表 → 合并 → 再 drop）"
   REPO="$ROOT/Sana/models/minimax_h3/Sol-H3-ComfyUI"
   cd "$REPO"
   # 4.1 主 DiT：BF16→FP8（保留 adaln_proj 供建表校验）
@@ -87,8 +99,8 @@ step "4/7 构建 FP8 权重（数小时；顺序不能乱：不带 drop-adaln �
     echo "!! p0f_light.py 需放到引擎 scripts/ 同级；参照 docs/deploy-log.md 手动补音频 AdaLN 行"
 fi
 
-# ---------- 5. 生成配置 ----------
-step "5/7 configure.py 生成 profile"
+# ---------- 6. 生成配置 ----------
+step "6/8 configure.py 生成 profile"
 cd "$ROOT/Sana/models/minimax_h3/Sol-H3-ComfyUI"
 $PY scripts/configure.py \
   --reuse-paths "$ROOT/sol-h3-settings/manifest.json" \
@@ -102,16 +114,16 @@ $PY scripts/configure.py \
   --fast-vae-code "$ROOT/sol-h3-vae/code" \
   --output-dir "$ROOT/sol-h3-settings-final" --gpu 0
 
-# ---------- 6. ComfyUI ----------
+# ---------- 7. ComfyUI ----------
 if [ "$1" != "--skip-comfyui" ]; then
-step "6/7 ComfyUI + 节点包 + 模型软链"
+step "7/8 ComfyUI + 节点包 + 模型软链"
   cd "$ROOT"
   git clone https://github.com/comfyanonymous/ComfyUI
   cd ComfyUI && /usr/local/miniconda3/envs/py312/bin/python -m venv venv
   ./venv/bin/pip install -r requirements.txt
-  bash "$ROOT/solh3-deploy/setup/install-custom-nodes.sh"
-  bash "$ROOT/solh3-deploy/setup/link-models.sh"
+  bash "$REPO_DIR/setup/install-custom-nodes.sh"
+  bash "$REPO_DIR/setup/link-models.sh"
   ln -sfn "$ROOT/Sana/models/minimax_h3/Sol-H3-ComfyUI" "$ROOT/ComfyUI/custom_nodes/Sol-H3-ComfyUI"
 fi
 
-step "7/7 完成！启动: bash scripts/launch_comfy.sh → http://<IP>:8188"
+step "8/8 完成！启动: bash scripts/launch_comfy.sh → http://<IP>:8188"

@@ -9,7 +9,7 @@ A complete single-GPU (RTX 5090) deployment of NVlabs Sol-H3 (MiniMax-H3): 8-ste
 ```
 sol-h3-deploy/
 ├── README.md / README_EN.md     ← This document (EN)
-├── setup.sh                     ← One-command deploy (env → compile → weights → FP8 → config → ComfyUI)
+├── setup.sh                     ← One-command deploy (env → compile → weights → engine+patch → FP8 → config → ComfyUI)
 ├── LICENSE                      ← MIT
 ├── .gitignore
 ├── engine/
@@ -24,6 +24,12 @@ sol-h3-deploy/
 │   └── p0f_light.py             ← AdaLN audio-reference row rebuilder
 ├── setup/
 │   ├── install-custom-nodes.sh  ← 7 third-party node packs (obvpm family etc.)
+│   ├── get-engine.sh            ← fetch the upstream engine (Sol-H3-ComfyUI from NVlabs/Sana)
+│   ├── apply-engine-patches.sh  ← back up + apply this repo's engine extension patches (idempotent, --revert)
+│   └── patches/
+│       ├── 0001-sol-h3-engine-extensions.patch  ← every engine change vs. upstream
+│       ├── orig/hyperflow_worker.py.orig        ← pristine upstream hyperflow_worker.py
+│       └── README.md
 │   └── link-models.sh           ← Recreate ComfyUI model symlinks
 └── docs/
     ├── USAGE.md                 ← Full manual (Chinese): modes, node wiring, params, obvpm pairing, troubleshooting
@@ -49,9 +55,10 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 | 1 | Python env (conda py312 + torch 2.13.0+cu132, etc.) | ~10 min |
 | 2 | Compile SageAttention 2.2 + Sol-Attn 0.5 from source (SM120) | ~20-40 min |
 | 3 | Download official weights (75 GB, ModelScope) | ~2 h at 10 MB/s (much faster on intranet) |
-| 4 | Build FP8 (main DiT + ref DiT + AdaLN tables; memory-safe sharded streaming) | ~2-2.5 h |
-| 5 | configure.py generates the profile | ~1 min |
-| 6 | ComfyUI + 7 node packs + model symlinks | ~10 min |
+| 4 | Fetch the upstream engine (NVlabs/Sana) + apply this repo's engine extension patches | ~3-5 min (few-hundred-MB clone) |
+| 5 | Build FP8 (main DiT + ref DiT + AdaLN tables; memory-safe sharded streaming) | ~2-2.5 h |
+| 6 | configure.py generates the profile | ~1 min |
+| 7 | ComfyUI + 7 node packs + model symlinks | ~10 min |
 
 **Fast path with prebuilt FP8** (45 GB from HF at 10 MB/s ≈ 75 min + steps 1/2/5/6 ≈ 1 h) → **~2 h total**:
 
@@ -59,6 +66,26 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 bash setup.sh --skip-weights --skip-build --skip-comfyui
 ```
+
+### The engine comes from upstream; our extensions travel as patches
+
+The engine itself is upstream [NVlabs/Sana](https://github.com/NVlabs/Sana)'s
+`models/minimax_h3/Sol-H3-ComfyUI`. Everything we added to it (Extend continuation,
+native reference image/audio sockets, `output_dir`/`filename`, conditions frozen as
+artifacts, take-based library, Studio's "continue from" picker) ships as a **patch**
+under `setup/patches/`, applied by `setup/apply-engine-patches.sh`:
+
+```bash
+bash setup/get-engine.sh                # fetch the upstream engine (if you don't have one)
+bash setup/apply-engine-patches.sh      # back up → patch → verify (idempotent)
+bash setup/apply-engine-patches.sh --revert   # restore the upstream version
+```
+
+`setup.sh` step 4 does both automatically, **before** the FP8 build (the build script
+is part of the patch too). Every touched file is backed up as `<file>.bak-<timestamp>`.
+If the patch no longer applies (upstream moved on) the script **stops with an error**
+instead of forcing it; in that case just overwrite the engine directory with this
+repo's `engine/Sol-H3-ComfyUI/` (the fully patched engine, 4.7 MB).
 
 ## Prebuilt FP8 weights (optional)
 

@@ -10,7 +10,7 @@ NVlabs Sol-H3（MiniMax-H3）在单卡 RTX 5090 上的完整部署：8 步加速
 sol-h3-deploy/
 ├── README.md                    ← 本文件
 ├── README_EN.md                 ← English version
-├── setup.sh                     ← 一键部署（环境→编译→权重→FP8构建→配置→ComfyUI）
+├── setup.sh                     ← 一键部署（环境→编译→权重→引擎+补丁→FP8构建→配置→ComfyUI）
 ├── LICENSE                      ← MIT
 ├── .gitignore
 ├── engine/
@@ -25,7 +25,13 @@ sol-h3-deploy/
 │   └── p0f_light.py             ← AdaLN 音频参考行补表工具
 ├── setup/
 │   ├── install-custom-nodes.sh  ← 7 个第三方节点包（obvpm 全家桶等）
-│   └── link-models.sh           ← ComfyUI 模型软链重建
+│   ├── link-models.sh           ← ComfyUI 模型软链重建
+│   ├── get-engine.sh            ← 取一份上游引擎（NVlabs/Sana 的 Sol-H3-ComfyUI）
+│   ├── apply-engine-patches.sh  ← 备份 + 打本仓库的引擎扩展补丁（幂等，可 --revert）
+│   └── patches/
+│       ├── 0001-sol-h3-engine-extensions.patch  ← 全部引擎改动（相对上游）
+│       ├── orig/hyperflow_worker.py.orig        ← 上游原始 hyperflow_worker.py
+│       └── README.md
 └── docs/
     ├── USAGE.md                 ← 完整使用手册（模式/节点连线/参数表/obvpm 搭配/排障）
     └── deploy-log.md            ← 部署日志与全部关键教训
@@ -43,6 +49,24 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 
 **权重不在本仓库**（51G，GitHub 装不下）：由 `setup.sh` 从 ModelScope/HuggingFace 下载官方权重并现场构建 FP8；想跳过构建可直接下载预构建 FP8（见下）。
 
+### 引擎本体来自上游，扩展以补丁形式跟着仓库走
+
+引擎本体是上游 [NVlabs/Sana](https://github.com/NVlabs/Sana) 的 `models/minimax_h3/Sol-H3-ComfyUI`，
+本仓库对它的扩展（续接 Extend、参考素材原生插槽、保存目录/文件名、条件冻结成产物、
+作品库对齐、Studio 续接来源选择器）以**补丁**形式放在 `setup/patches/`，
+由 `setup/apply-engine-patches.sh` 打到引擎目录上：
+
+```bash
+bash setup/get-engine.sh                # 取上游引擎（还没取的话）
+bash setup/apply-engine-patches.sh      # 备份 → 打补丁 → 校验（幂等）
+bash setup/apply-engine-patches.sh --revert   # 还原回上游版本
+```
+
+`setup.sh` 的第 4 步会自动做这两件事（**在 FP8 构建之前**——构建脚本本身也在补丁里）。
+每个被改动的文件都会先备份成 `<文件>.bak-<时间戳>`；补丁对不上（上游更新过）时脚本会
+**报错停下**，不会硬打。此时可以用本仓库 `engine/Sol-H3-ComfyUI/`（打过补丁的完整引擎，4.7M）
+直接覆盖引擎目录。
+
 ### 分步耗时（setup.sh 全流程约 3-4 小时）
 
 | 步骤 | 内容 | 耗时 |
@@ -50,9 +74,10 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 | 1 | Python 环境（conda py312 + torch 2.13.0+cu132 等） | ~10 分钟 |
 | 2 | 源码编译 SageAttention 2.2 + Sol-Attn 0.5（SM120） | ~20-40 分钟 |
 | 3 | 下载官方权重（75G，ModelScope） | 10MB/s ≈ 2 小时（机房内网更快） |
-| 4 | 构建 FP8（主 DiT + 参考图 DiT + AdaLN 查表，内存安全的分片流式路线） | ~2-2.5 小时 |
-| 5 | configure.py 生成 profile | ~1 分钟 |
-| 6 | ComfyUI + 7 个节点包 + 模型软链 | ~10 分钟 |
+| 4 | 取上游引擎（NVlabs/Sana）+ 打本仓库的引擎扩展补丁 | ~3-5 分钟（克隆数百 MB） |
+| 5 | 构建 FP8（主 DiT + 参考图 DiT + AdaLN 查表，内存安全的分片流式路线） | ~2-2.5 小时 |
+| 6 | configure.py 生成 profile | ~1 分钟 |
+| 7 | ComfyUI + 7 个节点包 + 模型软链 | ~10 分钟 |
 
 **跳过构建的快速路线**（用 HF 预构建 FP8，45G @10MB/s ≈ 75 分钟 + 步骤 1/2/5/6 ≈ 1 小时）→ **总计约 2 小时**：
 
