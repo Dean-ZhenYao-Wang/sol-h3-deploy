@@ -46,8 +46,9 @@ const MODES = [
     ['text', () => t('Text', '文生视频'), () => t('Prompt only', '仅提示词')],
     ['first_frame', () => t('First frame', '首帧'), () => t('Animate an image', '让图片动起来')],
     ['reference', () => t('Reference', '参考图'), () => t('Up to 9 images · 3 audios', '最多 9 张图 · 3 段音频')],
+    ['extend', () => t('Extend', '续接'), () => t('Continue the last take', '续接最新一条')],
 ];
-const MODE_NAME = { first_frame: () => t('first frame', '首帧'), reference: () => t('reference images', '参考图') };
+const MODE_NAME = { first_frame: () => t('first frame', '首帧'), reference: () => t('reference images', '参考图'), extend: () => t('extend', '续接') };
 const RESOLUTIONS = ['768p', '480p'];
 const CANVAS = { '768p': '1344 × 768', '480p': '864 × 480' };
 const PIPELINES = {
@@ -178,7 +179,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             b.setAttribute('role', 'radio');
             b.onclick = () => {
                 if (b.dataset.unsupported === 'true') return;
-                mode = id; set(node, 'mode', id); renderMode(); update();
+                mode = id; if (id !== 'extend') set(node, 'mode', id); renderMode(); update();
             };
             modeRow.append(b);
         }
@@ -202,6 +203,27 @@ export function createStudio({ app, api, onNodes = () => {} }) {
         const audioFile = el('input'); audioFile.type = 'file'; audioFile.accept = 'audio/*'; audioFile.hidden = true; audioFile.multiple = true;
         audioDrop.append(audioDropEmpty, audioThumbs, audioFile);
         modeSection.append(modeRow, drop, audioDrop, uploadNote);
+        const extendLabel = el('span', 'sh-field-label', t('Pin window', '续接窗口'));
+        const extendRow = el('div', 'sh-chips'); extendRow.setAttribute('role', 'radiogroup');
+        const extendNote = el('p', 'sh-note');
+        modeSection.append(extendLabel, extendRow, extendNote);
+        const WINDOWS = [39, 90, 56, 22, 5];
+        let windowFrames = Number(value(node, 'window_frames', 39)) || 39;
+        function renderWindows() {
+            extendRow.replaceChildren();
+            for (const n of WINDOWS) {
+                const b = button('', 'sh-chip'); b.dataset.id = String(n); b.append(el('span', null, String(n)));
+                b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', String(n === windowFrames));
+                b.disabled = mode !== 'extend';
+                b.title = (n === 39 || n === 90) ? t('Recommended (shared AV grid)', '推荐（共享音视频网格）') : '';
+                b.onclick = () => { windowFrames = n; renderWindows(); };
+                extendRow.append(b);
+            }
+            extendLabel.hidden = mode !== 'extend';
+            extendRow.hidden = mode !== 'extend';
+            extendNote.hidden = mode !== 'extend';
+            if (mode === 'extend') extendNote.textContent = t('Continues the newest take with its last ', '将续接最新一条生成，钉入其尾部 ') + windowFrames + t(' frames as context', ' 帧作为上下文');
+        }
         const limit = () => mode === 'first_frame' ? 1 : 9;
         const inputName = name => { const split = name.lastIndexOf('/'); return [name.slice(split + 1), split < 0 ? '' : name.slice(0, split)]; };
         function renderImages() {
@@ -230,8 +252,9 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 audios.forEach((name, index) => {
                     const chip = el('span', 'sh-note sh-audio-chip');
                     chip.textContent = '♪ ' + t('Audio ', '音') + (index + 1) + ' · ' + inputName(name)[0];
-                    const remove = button('', 'sh-thumb-remove', () => { audios = audios.filter(n => n !== name); saveAudios(); });
+                    const remove = button('', 'sh-audio-remove', () => { audios = audios.filter(n => n !== name); saveAudios(); });
                     remove.append(icon('close')); remove.setAttribute('aria-label', t('Remove audio', '移除音频'));
+                    remove.title = t('Remove audio', '移除音频');
                     chip.append(remove);
                     audioThumbs.append(chip);
                 });
@@ -279,9 +302,10 @@ export function createStudio({ app, api, onNodes = () => {} }) {
         drop.addEventListener('drop', e => { e.preventDefault(); upload(e.dataTransfer?.files || []); });
         function renderMode() {
             for (const b of modeRow.children) b.setAttribute('aria-checked', String(b.dataset.id === mode));
-            drop.hidden = mode === 'text';
+            drop.hidden = mode === 'text' || mode === 'extend';
             if (audioDrop) audioDrop.hidden = mode !== 'reference';
-            dropTitle.textContent = mode === 'reference' ? t('Drop up to 9 images and up to 3 audio clips, or click to upload', '拖入最多 9 张图片和 3 段音频，或点击上传')
+            if (typeof renderWindows === 'function') renderWindows();
+            dropTitle.textContent = mode === 'reference' ? t('Drop up to 9 images, or click to upload', '拖入最多 9 张图片，或点击上传')
                 : t('Drop an image or click to upload', '拖入图片或点击上传');
             if (mode === 'first_frame' && images.length > 1) saveImages();
             uploadNote.textContent = mode === 'reference' ? t('Subjects, characters or style to carry into the video.', '要带入视频的主体、角色或风格。')
@@ -430,9 +454,9 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             if (!prompt.value.trim()) return t('Describe your scene to start.', '先描述你的画面。');
             const p = profile();
             if (!p || /SOL_ENGINE_CONFIG/.test(p.name)) return t('Configure a Sol-H3 profile first (config.json).', '请先配置 Sol-H3 profile（config.json）。');
-            if (mode !== 'text' && !p.modes.includes(mode))
+            if (mode !== 'text' && mode !== 'extend' && !p.modes.includes(mode))
                 return t(`Switch pipeline to use ${MODE_NAME[mode]()}.`, `切换流程以使用${MODE_NAME[mode]()}模式。`);
-            if (mode !== 'text' && !images.length) return mode === 'first_frame'
+            if (mode !== 'text' && mode !== 'extend' && !images.length) return mode === 'first_frame'
                 ? t('Upload a first-frame image.', '请上传首帧图片。') : t('Upload at least one reference image.', '请至少上传一张参考图。');
             return '';
         }
@@ -444,7 +468,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             reason.textContent = why && !(running || submitting) ? why : '';
             const p = profile();
             for (const b of modeRow.children) {
-                const supported = b.dataset.id === 'text' || Boolean(p?.modes.includes(b.dataset.id));
+                const supported = b.dataset.id === 'text' || b.dataset.id === 'extend' || Boolean(p?.modes.includes(b.dataset.id));
                 b.dataset.unsupported = String(!supported);
                 b.setAttribute('aria-disabled', String(!supported));
                 const other = profiles.find(q => q.modes.includes(b.dataset.id));
@@ -557,11 +581,32 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 // Studio owns the seed; ComfyUI's after-generate control would change it twice.
                 const control = widget(node, 'control_after_generate') || widget(node, 'seed')?.linkedWidgets?.[0];
                 if (control) control.value = 'fixed';
-                set(node, 'prompt', prompt.value); set(node, 'mode', mode); set(node, 'image', mode === 'text' ? '' : images.join(','));
+                set(node, 'prompt', prompt.value);
+                if (mode !== 'extend') set(node, 'mode', mode);
+                set(node, 'image', mode === 'text' ? '' : images.join(','));
                 set(node, 'audio', mode === 'reference' ? audios.join(',') : '');
                 set(node, 'backend', 'local'); set(node, 'resolution', resolution);
                 renderTimeline();
                 const snapshot = await app.graphToPrompt();
+                if (mode === 'extend') {
+                    // Studio "Extend" routes through the dedicated SolH3Extend node
+                    // (Generate no longer carries extend fields). Empty session => newest take.
+                    const id = Object.keys(snapshot.prompt)[0];
+                    const g = snapshot.prompt[id];
+                    const keep = widget(node, 'keep_loaded')?.value ?? true;
+                    snapshot.prompt[id] = {
+                        class_type: 'SolH3Extend',
+                        inputs: {
+                            profile: String(g.inputs.profile),
+                            prompt: String(g.inputs.prompt),
+                            seed: Number(g.inputs.seed),
+                            session: '',
+                            window_frames: Number(windowFrames) || 39,
+                            keep_loaded: keep,
+                            resolution: String(g.inputs.resolution),
+                        },
+                    };
+                }
                 const reply = await api.queuePrompt(0, snapshot);
                 if (!reply?.prompt_id) throw new Error(t('ComfyUI did not accept the request.', 'ComfyUI 未接受该请求。'));
                 promptId = reply.prompt_id; settled = false; pendingTiming = null;
@@ -728,7 +773,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             dialog.remove();
             if (current?.dialog === dialog) current = null;
         });
-        renderPipelines(); renderMode(); renderFormat(); renderTimeline(); syncPrompt();
+        renderPipelines(); renderMode(); renderFormat(); renderWindows(); renderTimeline(); syncPrompt();
         refreshRecent(); poll();
         document.body.append(dialog); dialog.showModal();
         showTab(tab);

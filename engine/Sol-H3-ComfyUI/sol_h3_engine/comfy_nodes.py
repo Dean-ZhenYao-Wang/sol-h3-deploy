@@ -7,8 +7,9 @@ import time
 from . import bridge
 from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
 
-MODES = ["text", "first_frame", "reference"]
-MODE_LABELS = {"first_frame": "first-frame", "reference": "reference-image"}
+MODES = ["text", "first_frame", "reference", "extend"]
+GENERATE_MODES = ["text", "first_frame", "reference"]
+MODE_LABELS = {"text": "text", "first_frame": "first-frame", "reference": "reference-image", "extend": "extend"}
 BACKENDS = ["local"]
 # Latest update per node for GET /solh3/progress (polling fallback for reloads).
 PROGRESS = {}
@@ -49,13 +50,23 @@ def check_request(profile, mode, image, backend, resolution="768p"):
         raise ValueError("Unknown resolution: %s" % resolution)
     if resolution not in profile_resolutions(profile):
         raise ValueError("This pipeline renders %s only" % ", ".join(profile_resolutions(profile)))
-    if mode != "text":
-        if mode not in profile_modes(profile):
-            raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[mode])
+    effective = mode
+    if effective != "text":
+        if effective not in profile_modes(profile):
+            raise ValueError("This pipeline does not support %s mode" % MODE_LABELS[effective])
         if not image.strip():
-            raise ValueError("Upload an image for %s mode" % MODE_LABELS[mode])
-        if mode == "first_frame" and len([n for n in image.split(",") if n.strip()]) != 1:
+            raise ValueError("Upload an image for %s mode" % MODE_LABELS[effective])
+        if effective == "first_frame" and len([n for n in image.split(",") if n.strip()]) != 1:
             raise ValueError("First-frame mode takes exactly one image")
+
+
+def latest_session(output_root):
+    """Newest Sol-H3 session sidecar across all output sessions (Studio auto-continue)."""
+    import glob as _glob
+    found = _glob.glob(str(Path(output_root) / "sol_h3" / "*" / "request-*" / "session.session.safetensors"))
+    if not found:
+        raise ValueError("No take to continue yet: generate a video first (any mode), then Extend")
+    return max(found, key=os.path.getmtime)
 
 
 def write_sidecar(output_root, prompt_id, result, mode, seed, resolution="768p"):
@@ -89,7 +100,7 @@ class SolH3Generate:
             "keep_loaded": ("BOOLEAN", {"default": True}),
         }, "optional": {
             # Optional with defaults so workflows saved before Studio still load.
-            "mode": (MODES, {"default": "text"}),
+            "mode": (GENERATE_MODES, {"default": "text"}),
             "image": ("STRING", {"default": ""}),
             "audio": ("STRING", {"default": ""}),
             "backend": (BACKENDS, {"default": "local"}),
@@ -123,6 +134,7 @@ class SolH3Generate:
             raise ValueError("Audio references need reference mode")
         if len(audios) > 3:
             raise ValueError("At most 3 audio references")
+        extend = None
         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
         publish(node, prompt_id, "queued", started)
         output_root = folder_paths.get_output_directory()
@@ -144,7 +156,7 @@ class SolH3Generate:
             try:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
-                                         mode=mode, images=images, audios=audios,
+                                         mode=mode, images=images, audios=audios, extend=extend,
                                          progress=progress, resolution=resolution)
             finally:
                 if not keep_loaded:
@@ -223,18 +235,17 @@ class SolH3Extend:
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("Seed must be a nonnegative 63-bit integer")
-        if not (session or "").strip():
-            raise ValueError("Connect the previous take's session output, or paste its "
-                             ".session.safetensors path")
+        import folder_paths
+        output_root = folder_paths.get_output_directory()
+        # Empty session => continue the newest take (Studio auto-continue / node convenience).
+        session = (session or "").strip() or latest_session(output_root)
         if not 5 <= int(window_frames) <= 124:
             raise ValueError("window_frames must be between 5 and 124")
         check_request(profile, "text", "", "local", resolution)
         from comfy_api.latest import InputImpl
-        import folder_paths
         import comfy.model_management as mm
         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
         publish(node, prompt_id, "queued", started)
-        output_root = folder_paths.get_output_directory()
         try:
             settings = load_profile(profile)
             mm.unload_all_models()
