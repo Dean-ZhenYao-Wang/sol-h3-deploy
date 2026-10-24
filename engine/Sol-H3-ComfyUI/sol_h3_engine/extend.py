@@ -142,6 +142,24 @@ def session_path_for(request_dir):
     return Path(request_dir) / ("session" + SESSION_SUFFIX)
 
 
+def file_digest(path):
+    """SHA256 of a file, or "" when it cannot be read.
+
+    A take records the files it was conditioned on, so a later take that
+    inherits them can tell whether they are still the same ones. obvpm's
+    rule: a chain must never silently change its conditioning.
+    """
+    import hashlib
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
 def write_session(path, video, audio, meta):
     """Atomic session write: tmp file + os.replace (MP4 first, then this)."""
     from safetensors.torch import save_file

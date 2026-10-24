@@ -231,6 +231,33 @@ class StudioReferences(unittest.TestCase):
         images, audios = comfy_nodes.collect_references("reference", "", "", batch, (slot,))
         self.assertEqual((len(images), len(audios)), (1, 1))
 
+    def test_reference_records_and_inheritance(self):
+        import tempfile
+        import torch
+        from safetensors.torch import save_file
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "ref.png"
+            image.write_bytes(b"pixels")
+            digest = comfy_nodes._extend.file_digest(str(image))
+            sidecar = Path(temp) / "session.session.safetensors"
+            save_file({"video": torch.zeros((1, 24, 4, 8, 8)), "audio": torch.zeros((2, 32, 4))},
+                      str(sidecar), metadata={
+                          "format": "solx-v1",
+                          "references": json.dumps([{"kind": "image", "path": str(image),
+                                                    "sha256": digest}])})
+            # The take's own references come back, verified.
+            images, audios = comfy_nodes.inherited_references(str(sidecar))
+            self.assertEqual(images, [str(image)])
+            self.assertEqual(audios, [])
+            # A file that changed under the chain is refused by name, not swapped.
+            image.write_bytes(b"other pixels")
+            with self.assertRaisesRegex(ValueError, "has changed since"):
+                comfy_nodes.inherited_references(str(sidecar))
+            # A missing file is refused too.
+            image.unlink()
+            with self.assertRaisesRegex(ValueError, "which is gone"):
+                comfy_nodes.inherited_references(str(sidecar))
+
     def test_extend_takes_wired_references(self):
         import numpy as np
         # The Extend node routes a wired reference into the engine's reference mode.

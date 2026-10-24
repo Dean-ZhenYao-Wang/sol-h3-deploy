@@ -41,7 +41,7 @@ class EngineProcess:
             raise
 
     def generate(self, prompt, seed, decoder="original", cancel=None, mode="text", images=(), audios=(),
-                 progress=None, resolution="768p", extend=None):
+                 progress=None, resolution="768p", extend=None, references=None):
         self.sequence += 1
         response = self.root / ("response-%05d.json" % self.sequence)
         # A worker MAY write stage/step updates here; absence is normal.
@@ -51,6 +51,7 @@ class EngineProcess:
                    "case_id": "request-%05d" % self.sequence,
                    "mode": mode, "images": [str(path) for path in images],
                    "audios": [str(path) for path in audios], "resolution": resolution,
+                   "references": list(references or []),
                    "progress": str(progress_file)}
         if extend:
             command["extend"] = dict(extend)
@@ -120,7 +121,7 @@ _key = None
 
 
 def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode="text",
-             images=(), audios=(), progress=None, resolution="768p", extend=None):
+             images=(), audios=(), progress=None, resolution="768p", extend=None, references=None):
     global _engine, _key
     # One resident model session. Switching precision/decoder releases the old one.
     decoder = decoder or profile.get("decoder", "original")
@@ -135,7 +136,7 @@ def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode
         try:
             return _engine.generate(prompt, seed, decoder, cancel, mode=mode, images=images,
                                     audios=audios, progress=progress, resolution=resolution,
-                                    extend=extend)
+                                    extend=extend, references=references)
         except BaseException:
             _engine = None
             _key = None

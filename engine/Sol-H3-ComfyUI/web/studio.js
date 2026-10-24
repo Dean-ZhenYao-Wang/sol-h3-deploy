@@ -356,7 +356,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             if (mode === 'first_frame' && images.length > 1) saveImages();
             uploadNote.textContent = mode === 'reference' ? t('Subjects, characters or style to carry into the video.', '要带入视频的主体、角色或风格。')
                 : mode === 'first_frame' ? t('The video starts from this frame.', '视频从这张图开始。')
-                : mode === 'extend' ? t('Optional: references for THIS segment, on top of the take it continues.', '可选：这一段自己的参考素材（叠加在它所续接的那一条之上）。') : '';
+                : mode === 'extend' ? t('Optional: references for THIS segment. Leave empty to inherit the take it continues.', '可选：这一段自己的参考素材；留空则继承所续接那一段的参考。') : '';
             uploadNote.dataset.error = 'false';
             renderImages();
         }

@@ -867,6 +867,9 @@ def serve(options, write_json):
                         "seed": str(case["seed"]), "profile": options["name"],
                         "resolution": str(request.get("resolution", "768p")),
                         "task": payload.get("task", case["task"]), "source_path": "",
+                        # What this take was conditioned on, so a later take that
+                        # inherits the references can tell they are the same ones.
+                        "references": json.dumps(request.get("references") or []),
                     }
                 extend_request = request.get("extend")
                 if extend_request:

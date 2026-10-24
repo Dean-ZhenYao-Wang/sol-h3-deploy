@@ -7,6 +7,7 @@ import time
 import uuid
 
 from . import bridge
+from . import extend as _extend
 from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
 
 MODES = ["text", "first_frame", "reference", "extend"]
@@ -137,6 +138,68 @@ def collect_references(mode, image, audio, image_input=None, audio_slots=()):
             raise ValueError("At most 3 audio references")
     if len(images) > 9:
         raise ValueError("At most 9 reference images")
+    return images, audios
+
+
+def reference_records(images, audios):
+    """What a take was conditioned on: the files and their digests.
+
+    obvpm's rule, adapted: the take records the artifact, so a later take that
+    inherits the references can tell whether they are still the same ones.
+    """
+    records = []
+    for kind, paths in (("image", images), ("audio", audios)):
+        for path in paths:
+            records.append({"kind": kind, "path": str(path),
+                            "sha256": _extend.file_digest(path)})
+    return records
+
+
+def read_session_references(session_path):
+    """The reference records a take stored in its session sidecar."""
+    from safetensors import safe_open
+    path = Path(session_path or "")
+    if not path.is_file():
+        return []
+    try:
+        with safe_open(str(path), framework="pt") as handle:
+            raw = (handle.metadata() or {}).get("references")
+    except Exception:
+        return []
+    if not raw:
+        return []
+    try:
+        records = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(records, list):
+        return []
+    return [record for record in records if isinstance(record, dict)]
+
+
+def inherited_references(session_path):
+    """The parent take's own references, verified against their digests.
+
+    obvpm's model: a chain inherits the conditioning of the take it continues,
+    and a file that changed under it is refused by name rather than quietly
+    swapped for a new one.
+    """
+    images, audios = [], []
+    for record in read_session_references(session_path):
+        path = str(record.get("path") or "")
+        kind = str(record.get("kind") or "image")
+        if not path or not os.path.isfile(path):
+            raise ValueError("The take this extends was conditioned on %s, which is gone. "
+                             "Attach the reference again to continue."
+                             % (path or "an unnamed file"))
+        digest = _extend.file_digest(path)
+        expected = str(record.get("sha256") or "")
+        if expected and digest != expected:
+            raise ValueError("The take this extends was conditioned on %s, and that file has "
+                             "changed since (digest %s, was %s). Attach the reference again to "
+                             "continue with the new one, or restore the file."
+                             % (path, digest[:12], expected[:12]))
+        (images if kind == "image" else audios).append(path)
     return images, audios
 
 
@@ -332,6 +395,7 @@ class SolH3Generate:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
                                          mode=mode, images=images, audios=audios, extend=extend,
+                                         references=reference_records(images, audios),
                                          progress=progress, resolution=resolution)
             finally:
                 if not keep_loaded:
@@ -426,17 +490,21 @@ class SolH3Extend:
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("Seed must be a nonnegative 63-bit integer")
-        # A wired reference makes this a ref2va extend: the new take carries its own
-        # images and audio, while the pinned window keeps the seam continuous.
-        images, audios = collect_references("reference", image, audio, image_input,
-                                            (audio_1, audio_2, audio_3))
-        mode = "reference" if images else "text"
         import folder_paths
         output_root = folder_paths.get_output_directory()
         # Empty session => continue the newest take (Studio auto-continue / node convenience).
         session = (session or "").strip() or latest_session(output_root)
         if not 5 <= int(window_frames) <= 124:
             raise ValueError("window_frames must be between 5 and 124")
+        # A wired reference makes this a ref2va extend: the new take carries its own
+        # images and audio, while the pinned window keeps the seam continuous.
+        images, audios = collect_references("reference", image, audio, image_input,
+                                            (audio_1, audio_2, audio_3))
+        if not images and not audios:
+            # obvpm's model: the chain inherits the conditioning of the take it
+            # continues. Attach references to replace it.
+            images, audios = inherited_references(session)
+        mode = "reference" if images else "text"
         check_request(profile, mode, "local", resolution)
         from comfy_api.latest import InputImpl
         import comfy.model_management as mm
@@ -461,6 +529,7 @@ class SolH3Extend:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
                                          mode=mode, images=images, audios=audios,
+                                         references=reference_records(images, audios),
                                          progress=progress, resolution=resolution,
                                          extend={"session": session.strip(),
                                                  "window_frames": int(window_frames)})
