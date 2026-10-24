@@ -112,6 +112,34 @@ def materialize_audio(audio_input):
     return [str(target)]
 
 
+def collect_references(mode, image, audio, image_input=None, audio_slots=()):
+    """A take's reference images and audio.
+
+    Connected sockets first, then the file-name fields. The mode decides what
+    counts: a text take has no references, first-frame takes one image, and
+    reference takes up to nine images and three audio clips -- the engine needs an
+    image to go with audio.
+    """
+    if mode == "text":
+        return [], []
+    images = materialize_images(image_input)
+    if (image or "").strip():
+        images += resolve_images(image)
+    audios = []
+    if mode == "reference":
+        for slot in audio_slots:
+            audios += materialize_audio(slot)
+        if (audio or "").strip():
+            audios += resolve_images(audio)
+        if audios and not images:
+            raise ValueError("Audio references need a reference image (official constraint)")
+        if len(audios) > 3:
+            raise ValueError("At most 3 audio references")
+    if len(images) > 9:
+        raise ValueError("At most 9 reference images")
+    return images, audios
+
+
 def check_request(profile, mode, backend, resolution="768p"):
     """Profile, mode and resolution rules; the image count is checked once known."""
     if backend not in BACKENDS:
@@ -278,19 +306,9 @@ class SolH3Generate:
         import comfy.model_management as mm
         from comfy_api.latest import InputImpl
         # Connected sockets first, then the filename fields (the Studio writes those).
-        images = materialize_images(image_input) if mode != "text" else []
-        if mode != "text":
-            images += resolve_images(image or "")
-        audios = []
-        for slot in (audio_1, audio_2, audio_3):
-            audios += materialize_audio(slot)
-        if mode == "reference" and audio.strip():
-            audios += resolve_images(audio)
+        images, audios = collect_references(mode, image, audio, image_input,
+                                            (audio_1, audio_2, audio_3))
         check_images(mode, len(images))
-        if audios and mode != "reference":
-            raise ValueError("Audio references need reference mode")
-        if len(audios) > 3:
-            raise ValueError("At most 3 audio references")
         extend = None
         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
         publish(node, prompt_id, "queued", started)
@@ -374,12 +392,16 @@ class SolH3Extend:
             "keep_loaded": ("BOOLEAN", {"default": True}),
         }, "optional": {
             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
-            # The engine continues a take with text conditioning only; the sockets
-            # exist so the node graph shows that limit instead of hiding it.
-            "image_input": ("IMAGE", {"tooltip": "Not supported on Extend: an extend request carries text conditioning only. Put reference images on the first Generate of the chain."}),
-            "audio_1": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
-            "audio_2": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
-            "audio_3": ("AUDIO", {"tooltip": "Not supported on Extend: put reference audio on the first Generate of the chain."}),
+            # Reference files, for the Studio path; the sockets below take the same
+            # material in the node graph. Both may be used at once.
+            "image": ("STRING", {"default": "", "tooltip": "Reference image file names, comma separated (the new take's own references)."}),
+            "audio": ("STRING", {"default": "", "tooltip": "Reference audio file names, comma separated."}),
+            # A wired reference turns this into a ref2va extend: the new take carries
+            # its own images and audio while the pinned window keeps the seam.
+            "image_input": ("IMAGE", {"tooltip": "Connect LoadImage (or ImageBatch): the new take's own reference images. Empty = continue with text conditioning only."}),
+            "audio_1": ("AUDIO", {"tooltip": "Connect LoadAudio: the new take's reference audio 1 of up to 3. Needs a reference image."}),
+            "audio_2": ("AUDIO", {"tooltip": "Reference audio 2 of up to 3. Needs a reference image."}),
+            "audio_3": ("AUDIO", {"tooltip": "Reference audio 3 of up to 3. Needs a reference image."}),
             # New widgets sit last so workflows saved earlier keep their mapping.
             "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/extend."}),
             "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_extend_<time>_s<seed>."}),
@@ -397,23 +419,25 @@ class SolH3Extend:
         return float("nan")
 
     def generate(self, profile, prompt, seed, session, window_frames=39, keep_loaded=True,
-                 resolution="768p", output_dir="", filename="",
+                 resolution="768p", image="", audio="",
+                 output_dir="", filename="",
                  image_input=None, audio_1=None, audio_2=None, audio_3=None, unique_id=None):
         if not prompt.strip():
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError("Seed must be a nonnegative 63-bit integer")
-        if image_input is not None or any(slot is not None for slot in (audio_1, audio_2, audio_3)):
-            raise ValueError("Extend continues a take with text conditioning only: the engine "
-                             "refuses reference images or audio on an extend request. Put the "
-                             "references on the first Generate of the chain instead.")
+        # A wired reference makes this a ref2va extend: the new take carries its own
+        # images and audio, while the pinned window keeps the seam continuous.
+        images, audios = collect_references("reference", image, audio, image_input,
+                                            (audio_1, audio_2, audio_3))
+        mode = "reference" if images else "text"
         import folder_paths
         output_root = folder_paths.get_output_directory()
         # Empty session => continue the newest take (Studio auto-continue / node convenience).
         session = (session or "").strip() or latest_session(output_root)
         if not 5 <= int(window_frames) <= 124:
             raise ValueError("window_frames must be between 5 and 124")
-        check_request(profile, "text", "local", resolution)
+        check_request(profile, mode, "local", resolution)
         from comfy_api.latest import InputImpl
         import comfy.model_management as mm
         node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
@@ -436,7 +460,8 @@ class SolH3Extend:
             try:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
-                                         mode="text", progress=progress, resolution=resolution,
+                                         mode=mode, images=images, audios=audios,
+                                         progress=progress, resolution=resolution,
                                          extend={"session": session.strip(),
                                                  "window_frames": int(window_frames)})
             finally:

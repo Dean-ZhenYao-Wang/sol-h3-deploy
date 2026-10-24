@@ -311,7 +311,10 @@ def install_extend_patches():
         audio = block_state.audio_latents
         nca = block_state.num_condition_audio_rows
         steps = window["audio_steps"]
-        total = audio.shape[0] // 2  # channel-major rows: T steps per stereo channel
+        # The reference audio rows (nca) sit in front of the generated ones, so the
+        # generated rows per channel are what is left after them -- the same count
+        # the row plan pins the window against (num_audio_latents).
+        total = (audio.shape[0] - nca) // 2  # channel-major rows: T steps per stereo channel
         audio[nca:nca + steps] = window["audio_rows_ch0"].to(audio)
         audio[nca + total:nca + total + steps] = window["audio_rows_ch1"].to(audio)
         return result
@@ -867,9 +870,12 @@ def serve(options, write_json):
                     }
                 extend_request = request.get("extend")
                 if extend_request:
-                    if request.get("mode", "text") != "text" or request.get("images") or request.get("audios"):
-                        raise ValueError("An extend request carries text conditioning only "
-                                         "(no mode, images or audios)")
+                    mode = request.get("mode", "text")
+                    if mode not in ("text", "reference"):
+                        raise ValueError("An extend request carries text or reference conditioning "
+                                         "only (no other mode)")
+                    if mode == "reference" and not request.get("images"):
+                        raise ValueError("A reference extend needs at least one reference image")
                     window_ctx = _extend.build_extend(
                         extend_request["session"],
                         window_frames=int(extend_request.get("window_frames",
@@ -888,7 +894,13 @@ def serve(options, write_json):
                         raise ValueError("The session was rendered at %s, this request at %s"
                                          % (source_resolution, request.get("resolution", "768p")))
                     _EXTEND["window"] = window_ctx
-                    case["task"] = "t2va"
+                    # A reference extend keeps the ref2va task: the reference DiT and the
+                    # reference conditioning rows stay in play, and the pinned window rows
+                    # ride at the same conditioning levels (0.999 visual, 1.0 audio), so the
+                    # unique (timestep, endpoint) set -- and therefore the AdaLN table key --
+                    # is the one the ref2va variants already carry. A text extend stays t2va.
+                    if mode != "reference":
+                        case["task"] = "t2va"
                 row = engine.generate(case, payload, request_dir, progress)
                 e2e = (time.monotonic_ns() - started) / 1e9
                 progress("done", 8, 8)

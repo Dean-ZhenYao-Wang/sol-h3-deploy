@@ -65,7 +65,8 @@ ComfyUI 里有三个使用入口：
 2. 切到 **Extend** 模式，顶部提示词框写新内容（描述接下来发生什么），点 Generate
 3. **续接窗口**chip 行选择钉入多少帧：39（默认）/ 90 为共享音视频网格（推荐）；56/22/5 合法但接缝机制不同
 4. **续接来源**下拉框选要接着的那一段：默认是刚生成的那条，也可以选任意历史片段（**可以从链条中段续接**，与节点图里「把某个 session 输出口接到 Extend」完全等价）。下拉数据来自 `GET /solh3/sessions`
-5. 续接走 latent 级上下文（非像素重编码），59-66 秒/条，可无限链式
+5. **可选**：给这一段上传自己的参考图/音频（Extend 模式下图片与音频上传区是开放的）——两段场景或任务不同时用；不上传就是纯文本续接
+6. 续接走 latent 级上下文（非像素重编码），59-66 秒/条，可无限链式
 
 ### 保存位置（两种模式都能指定）
 
@@ -122,7 +123,8 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | session | 文本 | 空 | **接上一条 Generate 或 Extend 节点的 session 输出口（第三个输出）**，或直接粘 `.session.safetensors` 文件路径 |
 | window_frames | 整数 | 39 | 上一条尾部钉入上下文的帧数。推荐 39 或 90（共享音视频网格）；56/22/5 合法；范围 5–124 |
 | keep_loaded / resolution | — | 同 Generate | — |
-| **image_input / audio_1…3** | **图片/音频口** | — | **不支持**：引擎规定续接请求只走文本条件，接了会立刻报错（见下） |
+| **image / audio** | 文本 | 空 | 参考素材文件名，逗号分隔（Studio 上传走这条） |
+| **image_input / audio_1…3** | **图片/音频口** | — | **连线用**：接 `LoadImage` / `LoadAudio`，这一段**自己的**参考素材 |
 | output_dir | 文本 | 空 | 保存目录（相对 ComfyUI 输出目录）。空 = `SolH3/extend` |
 | filename | 文本 | 空 | 保存文件名（不含扩展名）。空 = `solh3_extend_<时间>_s<seed>` |
 
@@ -147,7 +149,8 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 - 混用时编号顺序 = **连线的在前、文本框的在后**
 - 模式决定这些口是否生效：`image_input` 只在 **first-frame / reference** 模式用；`audio_*` 只在 **reference** 模式用
 - Studio 里也认节点图上连进来的图（算作已提供参考图），但 Studio 自己的上传区仍是日常入口
-- **Extend 节点不支持参考素材**：引擎规定续接请求只走文本条件（`An extend request carries text conditioning only`）。把参考图/参考音频放在**链条的第一条 Generate** 上，后面的 Extend 靠潜空间上下文保持画面连续。给 Extend 连了参考素材会在跑之前就报错并告诉你该放哪儿
+- **Extend 节点同样可以带参考素材**：续接的这一段可以换成**自己的**参考图/参考音频（不同场景、不同任务时需要），尾窗潜空间仍然钉住接缝。引擎侧这叫 ref2va + 尾窗：参考行与窗口行同处条件档（0.999 / 1.0），AdaLN 查表已有对应行，不需要重建权重表。接缝实测 `mean|父段尾部 - 子段头部|` 约 3–7（0–255 尺度）＝连续
+- 音频参考要配至少一张参考图（官方约束），且同一条续接链上分辨率必须一致
 
 ### 标准连线图（文本版）
 
@@ -279,3 +282,4 @@ pkill -f "main.py"; sleep 3; bash /root/launch_comfy.sh
 6. **保存位置可控**：comfy_nodes.py 的 `output_dir` / `filename`（Generate 与 Extend 都有）——成片移到可读路径，默认名 `solh3_<模式>_<时间>_s<种子>`
 7. **Studio 续接来源选择器**：web/studio.js + `GET /solh3/sessions`——Studio 可选任意历史片段续接（与节点图端口接法对齐）
 8. **原生参考素材口**：comfy_nodes.py 的 `image_input`(IMAGE) / `audio_1…3`(AUDIO)——节点图可直接拉 `LoadImage` / `LoadAudio` 接线，节点内部落文件再交引擎
+9. **续接带参考素材（ref2va + 尾窗）**：hyperflow_worker.py 放开「续接只走文本条件」的护栏，有参考时走 ref2va（参考 DiT + 参考条件行），尾窗行仍钉在生成段头部；scheduler hook 的音频行偏移改为按生成行计（`(audio.shape[0] - nca) // 2`），否则带音频参考时 ch1 写入越界

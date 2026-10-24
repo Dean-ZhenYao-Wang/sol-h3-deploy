@@ -214,15 +214,32 @@ class StudioReferences(unittest.TestCase):
             self.assertEqual(handle.getnchannels(), 2)
             self.assertEqual(handle.getnframes(), 800)
 
-    def test_extend_refuses_wired_references(self):
+    def test_reference_collection_rules(self):
         import numpy as np
+        batch = np.zeros((1, 4, 4, 3), dtype="float32")
+        # A wired image is collected in reference mode.
+        images, audios = comfy_nodes.collect_references("reference", "", "", batch, ())
+        self.assertEqual(len(images), 1)
+        self.assertEqual(audios, [])
+        # A text take takes no references at all.
+        self.assertEqual(comfy_nodes.collect_references("text", "", "", batch, ()), ([], []))
+        # Audio without an image is refused: the engine needs an image to go with it.
+        slot = {"waveform": np.zeros((1, 1, 4), dtype="float32"), "sample_rate": 16000}
+        with self.assertRaisesRegex(ValueError, "need a reference image"):
+            comfy_nodes.collect_references("reference", "", "", None, (slot,))
+        # Audio with an image is fine -- this is the ref2va extend case.
+        images, audios = comfy_nodes.collect_references("reference", "", "", batch, (slot,))
+        self.assertEqual((len(images), len(audios)), (1, 1))
+
+    def test_extend_takes_wired_references(self):
+        import numpy as np
+        # The Extend node routes a wired reference into the engine's reference mode.
         node = comfy_nodes.SolH3Extend()
-        with self.assertRaisesRegex(ValueError, "text conditioning only"):
-            node.generate("FP8", "a scene", 1, session="x",
-                          image_input=np.zeros((1, 4, 4, 3), dtype="float32"))
-        with self.assertRaisesRegex(ValueError, "text conditioning only"):
-            node.generate("FP8", "a scene", 1, session="x",
-                          audio_1={"waveform": np.zeros((1, 1, 4), dtype="float32"), "sample_rate": 16000})
+        self.assertIn("image_input", comfy_nodes.SolH3Extend.INPUT_TYPES()["optional"])
+        self.assertIn("audio_1", comfy_nodes.SolH3Extend.INPUT_TYPES()["optional"])
+        images, _ = comfy_nodes.collect_references(
+            "reference", "", "", np.zeros((1, 4, 4, 3), dtype="float32"), ())
+        self.assertEqual("reference" if images else "text", "reference")
 
     def test_image_rules_use_the_resolved_count(self):
         node = comfy_nodes.SolH3Generate()

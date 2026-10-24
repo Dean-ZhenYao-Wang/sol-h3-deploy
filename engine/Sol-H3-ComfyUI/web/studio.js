@@ -288,7 +288,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             }
             dropEmpty.hidden = images.length > 0;
             thumbs.hidden = images.length === 0;
-            file.multiple = mode === 'reference';
+            file.multiple = mode !== 'first_frame';
             if (audioThumbs) {
                 audioThumbs.replaceChildren();
                 audios.forEach((name, index) => {
@@ -319,7 +319,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
         }
         async function upload(files) {
             const wanted = [...files].filter(f => f.type.startsWith('image/')).slice(0, limit() - (mode === 'first_frame' ? 0 : images.length));
-            const audioWanted = mode === 'reference' ? [...files].filter(f => f.type.startsWith('audio/')).slice(0, 3 - audios.length) : [];
+            const audioWanted = (mode === 'reference' || mode === 'extend') ? [...files].filter(f => f.type.startsWith('audio/')).slice(0, 3 - audios.length) : [];
             if (!wanted.length && !audioWanted.length) return;
             drop.dataset.busy = 'true'; uploadNote.textContent = t('Uploading…', '上传中…'); uploadNote.dataset.error = 'false';
             try {
@@ -338,14 +338,15 @@ export function createStudio({ app, api, onNodes = () => {} }) {
         }
         file.onchange = () => upload(file.files);
         audioFile.onchange = () => upload(audioFile.files);
-        audioDrop.hidden = mode !== 'reference';
+        audioDrop.hidden = mode !== 'reference' && mode !== 'extend';
         for (const name of ['dragenter', 'dragover']) drop.addEventListener(name, e => { e.preventDefault(); drop.dataset.over = 'true'; });
         for (const name of ['dragleave', 'drop']) drop.addEventListener(name, () => { drop.dataset.over = 'false'; });
         drop.addEventListener('drop', e => { e.preventDefault(); upload(e.dataTransfer?.files || []); });
         function renderMode() {
             for (const b of modeRow.children) b.setAttribute('aria-checked', String(b.dataset.id === mode));
-            drop.hidden = mode === 'text' || mode === 'extend';
-            if (audioDrop) audioDrop.hidden = mode !== 'reference';
+            // Extend can carry its own references: the new take may be a different scene.
+            drop.hidden = mode === 'text';
+            if (audioDrop) audioDrop.hidden = mode !== 'reference' && mode !== 'extend';
             if (typeof renderWindows === 'function') renderWindows();
             sourceLabel.hidden = mode !== 'extend';
             sourceSelect.hidden = mode !== 'extend';
@@ -354,7 +355,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 : t('Drop an image or click to upload', '拖入图片或点击上传');
             if (mode === 'first_frame' && images.length > 1) saveImages();
             uploadNote.textContent = mode === 'reference' ? t('Subjects, characters or style to carry into the video.', '要带入视频的主体、角色或风格。')
-                : mode === 'first_frame' ? t('The video starts from this frame.', '视频从这张图开始。') : '';
+                : mode === 'first_frame' ? t('The video starts from this frame.', '视频从这张图开始。')
+                : mode === 'extend' ? t('Optional: references for THIS segment, on top of the take it continues.', '可选：这一段自己的参考素材（叠加在它所续接的那一条之上）。') : '';
             uploadNote.dataset.error = 'false';
             renderImages();
         }
@@ -536,6 +538,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 return t(`Switch pipeline to use ${MODE_NAME[mode]()}.`, `切换流程以使用${MODE_NAME[mode]()}模式。`);
             if (mode !== 'text' && mode !== 'extend' && !images.length && !linked('image_input')) return mode === 'first_frame'
                 ? t('Upload a first-frame image.', '请上传首帧图片。') : t('Upload at least one reference image.', '请至少上传一张参考图。');
+            if (mode === 'extend' && audios.length && !images.length && !linked('image_input'))
+                return t('Reference audio needs a reference image.', '参考音频需要配一张参考图。');
             return '';
         }
         function update() {
@@ -664,7 +668,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 set(node, 'prompt', prompt.value);
                 if (mode !== 'extend') set(node, 'mode', mode);
                 set(node, 'image', mode === 'text' ? '' : images.join(','));
-                set(node, 'audio', mode === 'reference' ? audios.join(',') : '');
+                set(node, 'audio', (mode === 'reference' || mode === 'extend') ? audios.join(',') : '');
                 set(node, 'backend', 'local'); set(node, 'resolution', resolution);
                 set(node, 'output_dir', dirInput.value.trim());
                 set(node, 'filename', nameInput.value.trim());
@@ -689,6 +693,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                             window_frames: Number(windowFrames) || 39,
                             keep_loaded: keep,
                             resolution: String(g.inputs.resolution),
+                            image: String(g.inputs.image ?? ''),
+                            audio: String(g.inputs.audio ?? ''),
                             output_dir: String(g.inputs.output_dir ?? dirInput.value.trim()),
                             filename: String(g.inputs.filename ?? nameInput.value.trim()),
                         },
