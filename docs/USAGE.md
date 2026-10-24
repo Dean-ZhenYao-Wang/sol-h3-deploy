@@ -100,7 +100,7 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | profile | 下拉 | — | 同上 |
 | prompt | 多行文本 | 示例文本 | 描述接下来发生什么 |
 | seed | 整数 | 43 | 换条时建议 +1 避免与上条相同 |
-| session | 文本 | 空 | **接上一条的 session 输出**（Generate/Extend 的第三个输出口），或粘 `.session.safetensors` 文件路径 |
+| session | 文本 | 空 | **接上一条 Extend 节点的 session 输出口**（Generate 不输出 session），或直接粘 `.session.safetensors` 文件路径 |
 | window_frames | 整数 | 39 | 上一条尾部钉入上下文的帧数。推荐 39 或 90（共享音视频网格）；56/22/5 合法；范围 5–124 |
 | keep_loaded / resolution | — | 同 Generate | — |
 

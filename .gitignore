@@ -29,3 +29,4 @@ ComfyUI/venv/
 # 系统级
 *.log
 .DS_Store
+.ipynb_checkpoints/
