@@ -1,0 +1,31 @@
+# 该忽略的都不进 git（权重/环境/缓存/输出/软链）
+# —— 权重走 HuggingFace/ModelScope，见 README「权重分发」
+
+# 大二进制权重（共约 51G）
+*.safetensors
+*.pt
+transformer_hf8/
+transformer_ref_hf8/
+transformer_full/
+inductor_cache/
+sol-h3-vae/
+hyperflow-dl/
+
+# Python 环境与缓存
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ComfyUI 运行产物
+ComfyUI/output/
+ComfyUI/temp/
+ComfyUI/input/
+ComfyUI/user/
+ComfyUI/models/          # 软链目录，用 setup/link-models.sh 重建
+ComfyUI/custom_nodes/    # 第三方包，用 setup/install-custom-nodes.sh 重建
+ComfyUI/venv/
+
+# 系统级
+*.log
+.DS_Store

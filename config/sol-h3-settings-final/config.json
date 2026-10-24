@@ -1,0 +1,87 @@
+{
+  "profiles": {
+    "Sol-H3 one stage — RTX 5090": {
+      "precision": "hyperflow",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings-final/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600,
+      "label": "One stage",
+      "steps": 8,
+      "modes": [
+        "text",
+        "first_frame",
+        "reference"
+      ],
+      "hyperflow": {
+        "weights": "/root/hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors",
+        "deps": "/root/Sana/models/minimax_h3/HyperFlow",
+        "workflows": [
+          "t2va",
+          "fl2va",
+          "ref2va"
+        ],
+        "fp8_dir": "/root/hyperflow/transformer_hf8",
+        "adaln_table": "/root/hyperflow/transformer_hf8/adaln_table.pt",
+        "sol_attn": true,
+        "dense_attn": "sage2pp",
+        "compile": true,
+        "pin_unmatched_group": true,
+        "qwen_resident": true,
+        "fast_vae": {
+          "code": "/root/sol-h3-vae/code",
+          "vae_config": "/model/ModelScope/MiniMax/MiniMax-H3/vae/config.json",
+          "weights": "/root/sol-h3-vae/fast_h3_vae_noncausal_24l.safetensors"
+        },
+        "ref_fp8_dir": "/root/hyperflow/transformer_ref_hf8",
+        "ref_adaln_table": "/root/hyperflow/transformer_ref_hf8/adaln_table.pt",
+        "swap_ref_dit": true
+      },
+      "resolutions": [
+        "768p",
+        "480p"
+      ],
+      "device": "rtx5090"
+    },
+    "Sol-H3 HyperFlow · 8 steps — RTX 5090": {
+      "precision": "hyperflow",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings-final/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600,
+      "label": "HyperFlow · 8 steps",
+      "steps": 8,
+      "modes": [
+        "text"
+      ],
+      "hyperflow": {
+        "weights": "/root/hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors",
+        "deps": "/root/Sana/models/minimax_h3/HyperFlow",
+        "workflows": [
+          "t2va"
+        ]
+      }
+    },
+    "H3 FP8 — single RTX 5090": {
+      "precision": "fp8",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings-final/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600
+    },
+    "H3 BF16 — single RTX 5090": {
+      "precision": "bf16",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings-final/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600
+    },
+    "Original H3 50-step baseline — RTX 5090": {
+      "precision": "baseline",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings-final/paths.json",
+      "gpu": "0",
+      "timeout_s": 14400
+    }
+  }
+}

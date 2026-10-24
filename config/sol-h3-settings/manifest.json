@@ -1,0 +1,10 @@
+{
+  "stage1_python": "/root/h3_runtime_venv/bin/python",
+  "qwen_python": "/root/h3_runtime_venv/bin/python",
+  "h3_model": "/model/ModelScope/MiniMax/MiniMax-H3",
+  "fastvideo_root": "/root/sol-h3-runtime/FastVideo",
+  "fa4_root": "/root/fa4_root",
+  "ltx_root": "/root/sol-h3-runtime/LTX-2",
+  "qwen_checkpoint": "/model/ModelScope/Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+  "comfy_root": "/root/ComfyUI"
+}

@@ -1,0 +1,25 @@
+{
+  "profiles": {
+    "H3 FP8 — single RTX 5090": {
+      "precision": "fp8",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600
+    },
+    "H3 BF16 — single RTX 5090": {
+      "precision": "bf16",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings/paths.json",
+      "gpu": "0",
+      "timeout_s": 3600
+    },
+    "Original H3 50-step baseline — RTX 5090": {
+      "precision": "baseline",
+      "python": "/root/h3_runtime_venv/bin/python",
+      "paths": "/root/sol-h3-settings/paths.json",
+      "gpu": "0",
+      "timeout_s": 14400
+    }
+  }
+}
