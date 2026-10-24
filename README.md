@@ -45,16 +45,23 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 
 | 目录 | 内容 | 获取 |
 |---|---|---|
-| `hyperflow/transformer_hf8/` | 主 DiT FP8 + adaln_table.pt（含音频行） | HuggingFace `<你的账号>/sol-h3-fp8-5090` |
+| `hyperflow/transformer_hf8/` | 主 DiT FP8 + adaln_table.pt（含音频行） | HuggingFace [`ZhenYaoWang/sol-h3-fp8-5090`](https://huggingface.co/ZhenYaoWang/sol-h3-fp8-5090) |
 | `hyperflow/transformer_ref_hf8/` | 参考图 DiT FP8 + adaln_table.pt | 同上 |
 | `hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors` | HyperFlow LoRA | ModelScope `videorebirth/hyperflow` |
 | `sol-h3-vae/` | fast-VAE 权重 + code | ModelScope `Efficient-Large-Model/Sol-H3-VAE` |
 
-上传预构建权重到 HuggingFace：
+上传预构建权重到 HuggingFace（40G，数小时，建议 tmux 内执行防断线）：
+
 ```bash
-pip install huggingface_hub
-huggingface-cli upload <你的账号>/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 .
-huggingface-cli upload <你的账号>/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 .
+hf auth login                  # token: https://huggingface.co/settings/tokens（Write 权限）
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 .
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 .
+```
+
+使用者下载预构建权重（配合 `setup.sh --skip-build`）：
+
+```bash
+hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 ```
 
 ## 硬件要求
