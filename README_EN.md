@@ -103,6 +103,31 @@ hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 - AdaLN tables match on exact (t, endpoint) pairs; after changing LoRA/schedule/reference rules rerun `scripts/p0f_light.py`
 - obvpm's latent continuation only reads its own `.mctx.safetensors` sidecars; for latent-grade seamless continuation stay on Sol-H3 Extend end to end
 
+## LoRA & AdaLN table maintenance
+
+**The LoRA *is* the acceleration**: the HyperFlow 8-step LoRA (2.7 GB) distills 50-step sampling into 8 steps - 66 s/clip vs ~16 min/clip. Not optional; in daily use one LoRA serves forever with zero upkeep.
+
+**AdaLN lookup tables**: the FP8 DiT drops 26 GB of `adaln_proj` weights and reads precomputed rows keyed by exact (timestep, endpoint) pair sets. Consequences:
+
+| Change | Rebuild scope | Time |
+|---|---|---|
+| Nothing | Zero - weights + tables live in `/root/hyperflow/` permanently | - |
+| New reference rules (e.g. video refs) | Only add new pair-set rows (`scripts/p0f_light.py` pattern) | ~20 min |
+| Steps / schedule change | `build_adaln_table` + merge + `--drop-adaln` | ~1.5 h |
+| Swap / add a LoRA | Full chain below | ~3-4 h |
+
+Full rebuild chain for a new LoRA (same as `setup.sh` step 4, change `--hyperflow-weights`):
+
+```bash
+convert_fp8.py <BF16 transformer> <new LoRA> transformer_full          # keep adaln_proj
+save_payload.py x2 -> build_adaln_table.py -> merge_adaln_tables.py    # temb from the new LoRA
+convert_fp8.py --drop-adaln -> transformer_hf8
+convert_ref.py -> transformer_ref_hf8
+python scripts/p0f_light.py                                            # audio-reference rows
+```
+
+**Want a style/character LoRA on top?** Either merge it offline into the FP8 weights together with the HyperFlow LoRA (one rebuild, then zero runtime cost - recommended), or use the official ComfyUI node stack for occasional runtime LoRA loading (2-4 min/clip). The engine does **not** support runtime LoRA injection - offline merging is the premise for dropping `adaln_proj` safely.
+
 ## License
 
 [MIT](LICENSE) © 2026 王振耀 (Dean-ZhenYao-Wang)

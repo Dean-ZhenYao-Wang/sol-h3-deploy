@@ -101,9 +101,42 @@ hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 ## 已知限制
 
 - 视频参考（ref2va ≤3 段）未实现（conditioner 视频帧呈现未移植）
-- Studio 的 Reference 模式仅 One stage profile 可用（其它 profile 受 88GiB 内存限制装不下参考图 DiT；官方模板栈可用全集 ref2va）
 - AdaLN 表按精确 (t, endpoint) 对匹配；改 LoRA/调度/参考规则后重跑 `scripts/p0f_light.py`
 - obvpm 的 latent 续接只认它自己的 `.mctx.safetensors`；要 latent 级无缝续接请全程用 Sol-H3 Extend
+
+## LoRA 与 AdaLN 表维护
+
+**LoRA 就是加速本身**：HyperFlow 8 步 LoRA（2.7G）把 50 步采样压缩成 8 步——66 秒/条 vs 16 分钟/条。它不是可选项；日常创作一个 LoRA 用到底，零维护成本。
+
+**AdaLN 查表机制**：FP8 DiT 丢弃了 26GB 的 `adaln_proj` 权重，改用构建时预算好的表行（按精确的 (timestep, endpoint) 对匹配，`hyperflow_adaln.py`）。因此以下改动需要重建：
+
+| 改动 | 重建范围 | 耗时 |
+|---|---|---|
+| 什么都不改 | 零（权重+表都在 `/root/hyperflow/`，永久免维护） | — |
+| 改参考规则（如新增视频参考） | 只补新的 pair set 行（`scripts/p0f_light.py` 同款思路） | ~20 分钟 |
+| 改步数/采样调度 | `build_adaln_table` + merge + `--drop-adaln` | ~1.5 小时 |
+| 换/加 LoRA | 全链路重建（见下） | ~3-4 小时 |
+
+**换 LoRA 的完整重建链**（`setup.sh` 第 4 步同款，改 `--hyperflow-weights` 参数）：
+
+```bash
+# 1. 新 LoRA → FP8（保留 adaln_proj 供建表）
+convert_fp8.py <BF16 transformer 目录> <新LoRA.safetensors> transformer_full
+# 2. 重新建表（temb 用新 LoRA 合并后的 embedder 计算）
+save_payload.py ×2 → build_adaln_table.py → merge_adaln_tables.py
+# 3. 瘦身 + 参考图 DiT
+convert_fp8.py --drop-adaln → transformer_hf8
+convert_ref.py → transformer_ref_hf8
+# 4. 音频参考行（ref2va 音频变体）
+python scripts/p0f_light.py
+```
+
+**想叠加风格/角色 LoRA？** 两条路：
+
+- **离线合并**（推荐）：风格 LoRA 与 HyperFlow LoRA 一起 merge 进 FP8（一次重建）→ 之后所有生成自带该风格，零运行时开销、零加载时间
+- **官方栈运行时加载**：偶尔用的风格走官方模板栈（2-4 分钟/条），用灵活性换速度
+
+注意：引擎**不支持**运行时动态 LoRA——构建时离线合并是安全丢弃 `adaln_proj` 的前提。
 
 ## License
 
