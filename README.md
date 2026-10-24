@@ -30,7 +30,7 @@ sol-h3-deploy/
 ## 快速开始
 
 ```bash
-git clone <你的仓库> && cd sol-h3-deploy
+git clone https://github.com/Dean-ZhenYao-Wang/sol-h3-deploy.git && cd sol-h3-deploy
 # 一键部署（数小时：编译 + 75G 权重下载 + FP8 构建）
 bash setup.sh
 # 或分步：先装环境/节点，权重与构建另行准备时
