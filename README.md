@@ -1,5 +1,7 @@
 # sol-h3-deploy
 
+> **[English](README_EN.md)** · [中文](#sol-h3-deploy)
+
 NVlabs Sol-H3（MiniMax-H3）在单卡 RTX 5090 上的完整部署：8 步加速出片（768p 66s/条，480p 22s），支持文生视频/首帧/参考图（9图+3音频）/latent 级续接，附 obvpm 导演台搭配方案。
 
 ## 仓库结构
@@ -7,7 +9,9 @@ NVlabs Sol-H3（MiniMax-H3）在单卡 RTX 5090 上的完整部署：8 步加速
 ```
 sol-h3-deploy/
 ├── README.md                    ← 本文件
+├── README_EN.md                 ← English version
 ├── setup.sh                     ← 一键部署（环境→编译→权重→FP8构建→配置→ComfyUI）
+├── LICENSE                      ← MIT
 ├── .gitignore
 ├── engine/
 │   └── Sol-H3-ComfyUI/          ← 修改过的引擎源码（含自定义扩展，.bak-audio 备份可 diff）
@@ -31,13 +35,31 @@ sol-h3-deploy/
 
 ```bash
 git clone https://github.com/Dean-ZhenYao-Wang/sol-h3-deploy.git && cd sol-h3-deploy
-# 一键部署（数小时：编译 + 75G 权重下载 + FP8 构建）
+# 一键部署
 bash setup.sh
 # 或分步：先装环境/节点，权重与构建另行准备时
 bash setup.sh --skip-weights --skip-build --skip-comfyui
 ```
 
 **权重不在本仓库**（51G，GitHub 装不下）：由 `setup.sh` 从 ModelScope/HuggingFace 下载官方权重并现场构建 FP8；想跳过构建可直接下载预构建 FP8（见下）。
+
+### 分步耗时（setup.sh 全流程约 3-4 小时）
+
+| 步骤 | 内容 | 耗时 |
+|---|---|---|
+| 1 | Python 环境（conda py312 + torch 2.13.0+cu132 等） | ~10 分钟 |
+| 2 | 源码编译 SageAttention 2.2 + Sol-Attn 0.5（SM120） | ~20-40 分钟 |
+| 3 | 下载官方权重（75G，ModelScope） | 10MB/s ≈ 2 小时（机房内网更快） |
+| 4 | 构建 FP8（主 DiT + 参考图 DiT + AdaLN 查表，内存安全的分片流式路线） | ~2-2.5 小时 |
+| 5 | configure.py 生成 profile | ~1 分钟 |
+| 6 | ComfyUI + 7 个节点包 + 模型软链 | ~10 分钟 |
+
+**跳过构建的快速路线**（用 HF 预构建 FP8，45G @10MB/s ≈ 75 分钟 + 步骤 1/2/5/6 ≈ 1 小时）→ **总计约 2 小时**：
+
+```bash
+hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
+bash setup.sh --skip-weights --skip-build --skip-comfyui
+```
 
 ## 预构建 FP8 权重（可选加速）
 
@@ -81,3 +103,7 @@ hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 - 视频参考（ref2va ≤3 段）未实现（conditioner 视频帧呈现未移植）
 - AdaLN 表按精确 (t, endpoint) 对匹配；改 LoRA/调度/参考规则后重跑 `scripts/p0f_light.py`
 - obvpm 的 latent 续接只认它自己的 `.mctx.safetensors`；要 latent 级无缝续接请全程用 Sol-H3 Extend
+
+## License
+
+[MIT](LICENSE) © 2026 王振耀 (Dean-ZhenYao-Wang)
