@@ -101,6 +101,7 @@ hf download ZhenYaoWang/sol-h3-fp8-5090 --local-dir hyperflow
 ## 已知限制
 
 - 视频参考（ref2va ≤3 段）未实现（conditioner 视频帧呈现未移植）
+- Studio 的 Reference 模式仅 One stage profile 可用（其它 profile 受 88GiB 内存限制装不下参考图 DiT；官方模板栈可用全集 ref2va）
 - AdaLN 表按精确 (t, endpoint) 对匹配；改 LoRA/调度/参考规则后重跑 `scripts/p0f_light.py`
 - obvpm 的 latent 续接只认它自己的 `.mctx.safetensors`；要 latent 级无缝续接请全程用 Sol-H3 Extend
 

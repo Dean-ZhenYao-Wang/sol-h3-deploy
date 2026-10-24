@@ -29,6 +29,8 @@ ComfyUI 里有三个使用入口：
 | **Sol-H3 Studio**（默认界面） | 日常创作：文生视频 / 首帧 / 参考图 / 续接 | 快（66s/条） |
 | **Nodes 节点图** | 批处理、接入 ComfyUI 生态（Sol Engine 分类下 3 个节点） | 快 |
 | **Templates 模板浏览器** | 官方 MiniMax-H3 工作流（跑官方核，功能最全但慢） | 慢（分钟级/条） |
+> **关于其它 pipeline 的 Reference 模式**：Studio 里除 One stage 外的 profile（HyperFlow 8 步 / H3 FP8 / H3 BF16）都不支持参考图模式——这不是没配置，是硬件约束：ref2va 需要额外加载 `transformer_ref`（参考图 DiT），BF16 系两个 DiT 共 128GB 超过本机 88GiB 内存上限，H3 FP8 profile 更是加载即 OOM。只有 One stage（FP8 换入换出架构）能同时容纳两个 DiT。**其它 pipeline 要用 ref2va（含视频/音频参考的全集）请走官方模板栈**：Templates 浏览器 → MiniMax-H3 官方模板，用 Comfy-Org 的 int8/fp8 量化 checkpoint 跑官方核（约 2-4 分钟/条，参考类型不限）。
+
 
 ---
 
