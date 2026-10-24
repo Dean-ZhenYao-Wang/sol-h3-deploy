@@ -30,3 +30,6 @@ ComfyUI/venv/
 *.log
 .DS_Store
 .ipynb_checkpoints/
+
+# 引擎源码本地备份（上传时自动生成）
+*.bak-*

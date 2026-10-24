@@ -64,8 +64,23 @@ ComfyUI 里有三个使用入口：
 1. 先用任意模式生成一条片段——每次生成都会自动落下 `session.session.safetensors`（潜空间交接文件）
 2. 切到 **Extend** 模式，顶部提示词框写新内容（描述接下来发生什么），点 Generate
 3. **续接窗口**chip 行选择钉入多少帧：39（默认）/ 90 为共享音视频网格（推荐）；56/22/5 合法但接缝机制不同
-4. Studio 自动续接**最新一条**生成；想从特定某条续接，用节点图的 SolH3Extend 节点，把它的 session 输出（或 .session.safetensors 路径）填进 session 输入
+4. **续接来源**下拉框选要接着的那一段：默认是刚生成的那条，也可以选任意历史片段（**可以从链条中段续接**，与节点图里「把某个 session 输出口接到 Extend」完全等价）。下拉数据来自 `GET /solh3/sessions`
 5. 续接走 latent 级上下文（非像素重编码），59-66 秒/条，可无限链式
+
+### 保存位置（两种模式都能指定）
+
+Studio 界面新增「**保存位置**」区块（两种模式都生效），节点图里对应两个输入框：
+
+| 字段 | 含义 | 留空时 |
+|---|---|---|
+| **目录**（`output_dir`） | 相对 ComfyUI 输出目录的子目录，可写中文，如 `我的项目/2026-10` | `SolH3/<模式>`（如 `SolH3/text`、`SolH3/extend`） |
+| **文件名**（`filename`） | 不带扩展名，如 `河边日落` | `solh3_<模式>_<年月日-时分秒>_s<种子>`，如 `solh3_text_20261025-051233_s42` |
+
+要点：
+
+- 成片直接落在你指定的位置，例如 `output/我的项目/河边日落.mp4`；同名自动加 `_1`/`_2` 后缀，**不会静默覆盖**
+- 目录必须是**相对路径**且在 ComfyUI 输出目录内（不能写 `..` 或绝对路径）——因为 ComfyUI 的预览、下载、作品库都按输出目录寻址
+- 引擎内部的工作文件仍在 `output/sol_h3/<uuid>/request-NNNNN/`（session 潜变量、worker 日志都留在那里），成片被移出到可读路径
 
 ---
 
@@ -90,6 +105,8 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | audio | 文本 | 空 | 音频文件名，逗号分隔（仅 reference，≤3，顺序=编号） |
 | backend | 下拉 | local | 保持 local |
 | resolution | 下拉 | 768p | 768p（66s）/ 480p（22s） |
+| output_dir | 文本 | 空 | 保存目录（相对 ComfyUI 输出目录）。空 = `SolH3/<mode>` |
+| filename | 文本 | 空 | 保存文件名（不含扩展名）。空 = `solh3_<mode>_<时间>_s<seed>` |
 
 输出：`video_with_audio`（VIDEO，接预览/SaveVideo）、`timing_json`（STRING，计时明细）、`session`（STRING，**第三个输出口**——每次生成都会落 `session.session.safetensors`，可直接接到 SolH3Extend 的 `.session` 输入，或留空由 Extend 自动续最新一条）。
 
@@ -103,6 +120,8 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | session | 文本 | 空 | **接上一条 Generate 或 Extend 节点的 session 输出口（第三个输出）**，或直接粘 `.session.safetensors` 文件路径 |
 | window_frames | 整数 | 39 | 上一条尾部钉入上下文的帧数。推荐 39 或 90（共享音视频网格）；56/22/5 合法；范围 5–124 |
 | keep_loaded / resolution | — | 同 Generate | — |
+| output_dir | 文本 | 空 | 保存目录（相对 ComfyUI 输出目录）。空 = `SolH3/extend` |
+| filename | 文本 | 空 | 保存文件名（不含扩展名）。空 = `solh3_extend_<时间>_s<seed>` |
 
 输出：`video_with_audio`、`timing_json`、**`session`**（链条上下一个 Extend 的输入）。
 
@@ -148,7 +167,7 @@ obvpm（节点菜单搜 `obvpm`）是官方核生态的导演台：时间线、E
 
 ### 正确搭配姿势
 
-1. 在 Sol-H3 Studio / 节点图里生成第一条，用 Extend 续接出所有片段（成片落在 `/root/ComfyUI/output/sol_h3/`）
+1. 在 Sol-H3 Studio / 节点图里生成第一条，用 Extend 续接出所有片段（成片落在你指定的保存位置，默认 `output/SolH3/<模式>/`；引擎工作文件在 `/root/ComfyUI/output/sol_h3/`）
 2. 把成片 mp4 拖进 obvpm Timeline：排序、裁剪、预览整体节奏、导出成片
 3. 对不满意的中间段：回 Sol-H3 用 Extend 重生成那一段（latent 连续性保持），再拖回时间线
 4. 长链质量漂移时：在 Sol 里新起一条 seed 不同的生成，用 Extend 从旧链结尾接过去（相当于 obvpm 的 Bridge 思路）
@@ -175,7 +194,8 @@ obvpm（节点菜单搜 `obvpm`）是官方核生态的导演台：时间线、E
 | `/root/sol-h3-vae/` | fast-VAE 解码器权重（6.1G） |
 | `/root/Sana/models/minimax_h3/Sol-H3-ComfyUI/` | **引擎源码**（sol_h3_engine/ 是 ComfyUI 插件；example_workflows/ 有示例） |
 | `/root/ComfyUI/` | ComfyUI 本体（v0.42）+ custom_nodes/（obvpm 等 7 个包） |
-| `/root/ComfyUI/output/sol_h3/` | Studio/节点图生成输出（mp4 + session 文件） |
+| `/root/ComfyUI/output/SolH3/<模式>/` | **成片**（默认保存位置；`output_dir`/`filename` 可改，Studio 作品库收录这里） |
+| `/root/ComfyUI/output/sol_h3/<uuid>/request-NNNNN/` | 引擎工作目录：session 潜变量（`session.session.safetensors`）、worker 日志、原始 MP4 |
 | `/root/p0f_light.py` | AdaLN 补表工具（见排障） |
 | `/model/ModelScope/MiniMax/MiniMax-H3/` | 原始 BF16 权重（只读网络盘，勿占本地空间拷贝） |
 
@@ -219,3 +239,5 @@ pkill -f "main.py"; sleep 3; bash /root/launch_comfy.sh
 3. **参考图上限 4→9**：web/studio.js 的 `limit()`
 4. **续接（Extend）**：引擎 + SolH3Extend 节点 + Studio Extend 模式（P1/P2，已验证）
 5. **AdaLN 表音频扩展行**：transformer_hf8 与 transformer_ref_hf8 的 adaln_table.pt 各 +8 个音频参考变体行（p0f_light.py 生成）
+6. **保存位置可控**：comfy_nodes.py 的 `output_dir` / `filename`（Generate 与 Extend 都有）——成片移到可读路径，默认名 `solh3_<模式>_<时间>_s<种子>`
+7. **Studio 续接来源选择器**：web/studio.js + `GET /solh3/sessions`——Studio 可选任意历史片段续接（与节点图端口接法对齐）

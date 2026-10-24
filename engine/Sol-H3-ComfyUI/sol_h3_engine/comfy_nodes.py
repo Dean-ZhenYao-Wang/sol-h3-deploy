@@ -69,11 +69,64 @@ def latest_session(output_root):
     return max(found, key=os.path.getmtime)
 
 
+def safe_stem(name):
+    """A file stem that stays on one path segment (no separators, no traversal)."""
+    stem = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    stem = stem.replace("\x00", "").strip()
+    if stem in (".", ".."):
+        return ""
+    return stem
+
+
+def resolve_output_dir(output_root, output_dir, mode):
+    """Where a take is saved: a folder under the ComfyUI output root."""
+    root = Path(output_root).resolve()
+    raw = str(output_dir or "").strip().replace("\\", "/").strip("/")
+    if not raw:
+        raw = "SolH3/%s" % mode
+    if ".." in raw.split("/"):
+        raise ValueError("output_dir must stay inside the ComfyUI output folder")
+    folder = (root / raw).resolve()
+    try:
+        folder.relative_to(root)
+    except ValueError:
+        raise ValueError("output_dir must stay inside the ComfyUI output folder") from None
+    return folder
+
+
+def default_stem(mode, seed):
+    """A readable default: solh3_<mode>_<time>_s<seed>."""
+    return "solh3_%s_%s_s%d" % (mode, time.strftime("%Y%m%d-%H%M%S"), seed)
+
+
+def place_take(output_root, result, output_dir, filename, mode, seed):
+    """Move the engine MP4 to a human-readable path and return that path.
+
+    The engine writes into an opaque work folder (sol_h3/<uuid>/request-NNNNN), so
+    the take is moved out to <output_dir>/<name>.mp4 and the output tree reads
+    SolH3/<mode>/solh3_<mode>_<time>_s<seed>.mp4 unless the caller names it.
+    """
+    source = Path(result["output"])
+    folder = resolve_output_dir(output_root, output_dir, mode)
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = safe_stem(filename) or default_stem(mode, seed)
+    target = folder / (stem + ".mp4")
+    index = 1
+    while target.exists():
+        target = folder / ("%s_%d.mp4" % (stem, index))
+        index += 1
+    os.replace(str(source), str(target))
+    result["engine_output"] = str(source)
+    result["output"] = str(target)
+    return target
+
+
 def write_sidecar(output_root, prompt_id, result, mode, seed, resolution="768p"):
-    """Library record; SaveVideo writes the MP4, so the record lives beside the library."""
+    """Library record; the take itself lives at the readable path."""
     folder = Path(output_root) / "SolH3" / "library"
     folder.mkdir(parents=True, exist_ok=True)
-    record = {"id": prompt_id, "engine_output": result.get("output"),
+    record = {"id": prompt_id, "engine_output": result.get("engine_output") or result.get("output"),
+              "output_path": result.get("output"),
               "delivered_output": result.get("delivered_output"), "session": result.get("session"),
               "prompt": result.get("prompt"), "mode": mode, "profile": result.get("profile"),
               "seed": seed, "resolution": resolution, "e2e_s": result.get("e2e_s"), "created": time.time()}
@@ -105,6 +158,9 @@ class SolH3Generate:
             "audio": ("STRING", {"default": ""}),
             "backend": (BACKENDS, {"default": "local"}),
             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
+            # New widgets sit last so workflows saved earlier keep their mapping.
+            "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/<mode>."}),
+            "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_<mode>_<time>_s<seed>."}),
         }, "hidden": {"unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
@@ -119,7 +175,7 @@ class SolH3Generate:
         return float("nan")
 
     def generate(self, profile, prompt, seed, keep_loaded=True, mode="text", image="", audio="",
-                 backend="local", resolution="768p", unique_id=None):
+                 backend="local", resolution="768p", output_dir="", filename="", unique_id=None):
         if not prompt.strip():
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
@@ -162,6 +218,7 @@ class SolH3Generate:
                 if not keep_loaded:
                     bridge.close()
             publish(node, prompt_id, "saving", started, steps=steps)
+            place_take(output_root, result, output_dir, filename, mode, seed)
             if prompt_id:
                 write_sidecar(output_root, prompt_id, result, mode, seed, resolution)
         except BaseException as error:
@@ -216,6 +273,9 @@ class SolH3Extend:
             "keep_loaded": ("BOOLEAN", {"default": True}),
         }, "optional": {
             "resolution": (list(RESOLUTIONS), {"default": "768p"}),
+            # New widgets sit last so workflows saved earlier keep their mapping.
+            "output_dir": ("STRING", {"default": "", "tooltip": "Save folder, relative to the ComfyUI output folder. Empty = SolH3/extend."}),
+            "filename": ("STRING", {"default": "", "tooltip": "File name without extension. Empty = solh3_extend_<time>_s<seed>."}),
         }, "hidden": {"unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
@@ -230,7 +290,7 @@ class SolH3Extend:
         return float("nan")
 
     def generate(self, profile, prompt, seed, session, window_frames=39, keep_loaded=True,
-                 resolution="768p", unique_id=None):
+                 resolution="768p", output_dir="", filename="", unique_id=None):
         if not prompt.strip():
             raise ValueError("Enter a nonempty prompt")
         if type(seed) is not int or not 0 <= seed < 2**63:
@@ -271,6 +331,7 @@ class SolH3Extend:
                 if not keep_loaded:
                     bridge.close()
             publish(node, prompt_id, "saving", started, steps=steps)
+            place_take(output_root, result, output_dir, filename, "extend", seed)
             if prompt_id:
                 write_sidecar(output_root, prompt_id, result, "extend", seed, resolution)
         except BaseException as error:

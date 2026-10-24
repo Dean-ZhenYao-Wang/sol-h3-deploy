@@ -92,6 +92,11 @@
 .sh-seed input{width:100%;height:38px;padding:0 12px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);font-variant-numeric:tabular-nums;outline:none}
 .sh-seed input:focus{border-color:var(--sh-accent-line)}
 .sh-seed input:disabled{color:var(--sh-faint)}
+.sh-text{width:100%;height:38px;padding:0 12px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);outline:none}
+.sh-text:focus{border-color:var(--sh-accent-line)}
+.sh-text::placeholder{color:var(--sh-faint)}
+.sh-select{width:100%;height:38px;padding:0 10px;border-radius:var(--sh-r-sm);border:1px solid var(--sh-border);background:var(--sh-card);color:var(--sh-ink);font:13.5px var(--sh-font);outline:none}
+.sh-select:focus{border-color:var(--sh-accent-line)}
 .sh-seed .sh-icon-button{border-color:var(--sh-border);background:var(--sh-card);width:38px;height:38px}
 
 /* Chips (format). */
@@ -246,3 +251,8 @@
   background:rgba(16,19,23,.92);backdrop-filter:blur(10px);border:1px solid var(--sh-border);box-shadow:0 12px 32px rgba(0,0,0,.4);color:var(--sh-ink)}
 .sh-pill .sh-wordmark img{width:22px;height:22px}.sh-pill .sh-wordmark b{font-size:14px}
 .sh-pill .sh-switch-item{min-width:68px;height:28px}
+
+.sh-audio-chip{position:relative;display:inline-flex;align-items:center;gap:6px;padding:4px 8px;margin:4px 6px 0 0;border-radius:8px;background:var(--color-background-secondary,#f1efe8);font-size:12px;line-height:18px}
+.sh-audio-remove{display:grid;place-items:center;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:rgba(10,12,15,.78);color:#fff;cursor:pointer;flex:none}
+.sh-audio-remove .sh-icon{width:11px;height:11px}
+.sh-audio-remove:hover{background:#c0392b}

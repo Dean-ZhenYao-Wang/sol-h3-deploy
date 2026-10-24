@@ -179,7 +179,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             b.setAttribute('role', 'radio');
             b.onclick = () => {
                 if (b.dataset.unsupported === 'true') return;
-                mode = id; if (id !== 'extend') set(node, 'mode', id); renderMode(); update();
+                mode = id; if (id !== 'extend') set(node, 'mode', id); renderMode(); savePath(); update();
             };
             modeRow.append(b);
         }
@@ -222,7 +222,49 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             extendLabel.hidden = mode !== 'extend';
             extendRow.hidden = mode !== 'extend';
             extendNote.hidden = mode !== 'extend';
-            if (mode === 'extend') extendNote.textContent = t('Continues the newest take with its last ', '将续接最新一条生成，钉入其尾部 ') + windowFrames + t(' frames as context', ' 帧作为上下文');
+            if (mode === 'extend') extendNote.textContent = t('Pins the last ', '钉入所选片段的尾部 ') + windowFrames + t(' frames as context', ' 帧作为上下文');
+        }
+        // Which take to continue: the same choice the node graph makes by wiring a
+        // session output into the Extend node's session input.
+        const sourceLabel = el('span', 'sh-field-label', t('Continue from', '续接来源'));
+        const sourceSelect = el('select', 'sh-select');
+        const sourceNote = el('p', 'sh-note');
+        modeSection.append(sourceLabel, sourceSelect, sourceNote);
+        let sessionItems = [], selectedSession = '', lastSession = '';
+        const sessionLabel = item => {
+            const when = item.created ? new Date(item.created * 1000).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en') : '';
+            const name = item.output ? item.output.split('/').pop().replace(/\.mp4$/i, '') : '';
+            const what = item.mode && MODE_NAME[item.mode] ? MODE_NAME[item.mode]() : t('take', '片段');
+            return [name || what, when].filter(Boolean).join(' · ');
+        };
+        function renderSessions() {
+            sourceSelect.replaceChildren();
+            if (!sessionItems.length) {
+                const empty = el('option', null, t('No take to continue yet', '还没有可续接的片段'));
+                empty.value = ''; sourceSelect.append(empty);
+            }
+            for (const item of sessionItems) {
+                const option = el('option', null, sessionLabel(item));
+                option.value = item.session;
+                sourceSelect.append(option);
+            }
+            if (selectedSession && !sessionItems.some(item => item.session === selectedSession)) selectedSession = '';
+            if (!selectedSession && lastSession && sessionItems.some(item => item.session === lastSession)) selectedSession = lastSession;
+            if (!selectedSession && sessionItems.length) selectedSession = sessionItems[0].session;
+            sourceSelect.value = selectedSession;
+            sourceSelect.onchange = () => { selectedSession = sourceSelect.value; renderSessionNote(); };
+            renderSessionNote();
+        }
+        function renderSessionNote() {
+            const item = sessionItems.find(entry => entry.session === selectedSession);
+            sourceNote.textContent = item
+                ? (item.prompt ? item.prompt.slice(0, 140) : t('This take', '这一段'))
+                : t('Generate a video first, then pick the take to continue.', '请先生成一条视频，再选择要续接的片段。');
+        }
+        async function refreshSessions() {
+            try { sessionItems = (await json('/solh3/sessions?limit=40')).items || []; }
+            catch { sessionItems = []; }
+            renderSessions();
         }
         const limit = () => mode === 'first_frame' ? 1 : 9;
         const inputName = name => { const split = name.lastIndexOf('/'); return [name.slice(split + 1), split < 0 ? '' : name.slice(0, split)]; };
@@ -305,6 +347,9 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             drop.hidden = mode === 'text' || mode === 'extend';
             if (audioDrop) audioDrop.hidden = mode !== 'reference';
             if (typeof renderWindows === 'function') renderWindows();
+            sourceLabel.hidden = mode !== 'extend';
+            sourceSelect.hidden = mode !== 'extend';
+            sourceNote.hidden = mode !== 'extend';
             dropTitle.textContent = mode === 'reference' ? t('Drop up to 9 images, or click to upload', '拖入最多 9 张图片，或点击上传')
                 : t('Drop an image or click to upload', '拖入图片或点击上传');
             if (mode === 'first_frame' && images.length > 1) saveImages();
@@ -395,6 +440,37 @@ export function createStudio({ app, api, onNodes = () => {} }) {
         dice.append(icon('dice')); dice.title = t('New seed', '换一个种子'); dice.setAttribute('aria-label', dice.title);
         seedRow.append(seedChips, seedInput, dice);
         seedSection.append(seedRow);
+
+        // Save target: folder + file name. Empty means the node's readable default.
+        const saveSection = section(t('Save to', '保存位置'));
+        const saveGrid = el('div', 'sh-format');
+        const dirBlock = el('div', 'sh-field'), nameBlock = el('div', 'sh-field');
+        const dirInput = el('input', 'sh-text'); dirInput.type = 'text';
+        dirInput.placeholder = t('SolH3/text', 'SolH3/text');
+        dirInput.value = String(value(node, 'output_dir', '') || '');
+        dirInput.setAttribute('aria-label', t('Save folder', '保存目录'));
+        const nameInput = el('input', 'sh-text'); nameInput.type = 'text';
+        nameInput.placeholder = t('auto', '自动');
+        nameInput.value = String(value(node, 'filename', '') || '');
+        nameInput.setAttribute('aria-label', t('File name', '文件名'));
+        dirBlock.append(el('span', 'sh-field-label', t('Folder', '目录')), dirInput);
+        nameBlock.append(el('span', 'sh-field-label', t('File name', '文件名')), nameInput);
+        saveGrid.append(dirBlock, nameBlock);
+        const saveNote = el('p', 'sh-note');
+        saveSection.append(saveGrid, saveNote);
+        const savePath = () => {
+            const folder = dirInput.value.trim() || `SolH3/${mode === 'extend' ? 'extend' : mode}`;
+            const name = nameInput.value.trim() || t('auto', 'auto');
+            saveNote.textContent = t('Saves to ', '将保存到 ') + folder + '/' + name + '.mp4'
+                + (nameInput.value.trim() ? '' : t('  (auto-named)', '（自动命名）'));
+        };
+        const syncSave = () => {
+            set(node, 'output_dir', dirInput.value.trim());
+            set(node, 'filename', nameInput.value.trim());
+            savePath(); update();
+        };
+        dirInput.addEventListener('change', syncSave);
+        nameInput.addEventListener('change', syncSave);
 
         // Footer: Generate.
         const generate = button('', 'sh-generate');
@@ -544,6 +620,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             if (!promptId || prompt_id !== promptId) return;
             if (String(id) === String(node.id) && out?.text?.[0]) {
                 try { pendingTiming = JSON.parse(out.text[0]); } catch { pendingTiming = null; }
+                // The report carries this take's session sidecar: the next extend picks it up.
+                if (pendingTiming?.session) lastSession = pendingTiming.session;
             }
             const files = [...(out?.images || []), ...(out?.videos || []), ...(out?.gifs || []), ...(out?.solh3_video || [])]
                 .filter(f => isVideo(f.filename));
@@ -552,7 +630,7 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 const f = files[0];
                 showVideo({ file: f.filename, subfolder: f.subfolder, type: f.type, e2e_s: pendingTiming?.e2e_s,
                     profile: pendingTiming?.profile, seed: pendingTiming?.seed ?? value(node, 'seed') });
-                update(); refreshRecent();
+                update(); refreshRecent(); refreshSessions();
             }
         };
         const onError = e => {
@@ -586,12 +664,17 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                 set(node, 'image', mode === 'text' ? '' : images.join(','));
                 set(node, 'audio', mode === 'reference' ? audios.join(',') : '');
                 set(node, 'backend', 'local'); set(node, 'resolution', resolution);
+                set(node, 'output_dir', dirInput.value.trim());
+                set(node, 'filename', nameInput.value.trim());
                 renderTimeline();
                 const snapshot = await app.graphToPrompt();
                 if (mode === 'extend') {
                     // Studio "Extend" routes through the dedicated SolH3Extend node
-                    // (Generate no longer carries extend fields). Empty session => newest take.
-                    const id = Object.keys(snapshot.prompt)[0];
+                    // (Generate no longer carries extend fields). The session is the
+                    // chosen take's sidecar, exactly like wiring a session output in
+                    // the node graph; empty falls back to the newest take.
+                    const id = Object.keys(snapshot.prompt).find(key => snapshot.prompt[key].class_type === 'SolH3Generate')
+                        || Object.keys(snapshot.prompt)[0];
                     const g = snapshot.prompt[id];
                     const keep = widget(node, 'keep_loaded')?.value ?? true;
                     snapshot.prompt[id] = {
@@ -600,10 +683,12 @@ export function createStudio({ app, api, onNodes = () => {} }) {
                             profile: String(g.inputs.profile),
                             prompt: String(g.inputs.prompt),
                             seed: Number(g.inputs.seed),
-                            session: '',
+                            session: selectedSession || '',
                             window_frames: Number(windowFrames) || 39,
                             keep_loaded: keep,
                             resolution: String(g.inputs.resolution),
+                            output_dir: String(g.inputs.output_dir ?? dirInput.value.trim()),
+                            filename: String(g.inputs.filename ?? nameInput.value.trim()),
                         },
                     };
                 }
@@ -773,8 +858,8 @@ export function createStudio({ app, api, onNodes = () => {} }) {
             dialog.remove();
             if (current?.dialog === dialog) current = null;
         });
-        renderPipelines(); renderMode(); renderFormat(); renderWindows(); renderTimeline(); syncPrompt();
-        refreshRecent(); poll();
+        renderPipelines(); renderMode(); renderFormat(); renderWindows(); renderTimeline(); syncPrompt(); savePath();
+        refreshRecent(); refreshSessions(); poll();
         document.body.append(dialog); dialog.showModal();
         showTab(tab);
         requestAnimationFrame(() => (tab === 'studio' ? prompt : galleryTab).focus({ preventScroll: true, focusVisible: false }));

@@ -20,52 +20,117 @@ def _sidecars(output_root):
 
 
 def list_videos(output_root, limit=24, history=None):
-    """Newest-first SolH3/**/*.mp4 merged with node sidecars.
+    """One entry per Sol-H3 take, newest first.
 
-    `history(prompt_id)` may return saved (subfolder, filename) pairs from ComfyUI's
-    history for an exact match; otherwise a sidecar claims the first MP4 written after it.
+    A take is the file the node itself wrote (its readable path); older records
+    fall back to claiming an MP4 written around that moment. MP4s in the output
+    tree that a take already explains -- a SaveVideo copy of the same take --
+    are skipped, so the library never lists one clip twice.
     """
     root = Path(output_root).resolve()
+    records = _sidecars(root)
     videos = []
     for path in (root / "SolH3").rglob("*.mp4"):
-        if LIBRARY in path.relative_to(root).parents:
+        relative = path.relative_to(root)
+        if relative.parts[:2] == ("SolH3", "library"):
             continue
         videos.append((path.stat().st_mtime, path))
     videos.sort()
-    meta, claimed, known = {}, set(), {path for _, path in videos}
-    for record in _sidecars(root):
-        exact = []
-        if history is not None and record.get("id"):
+    known = {path for _, path in videos}
+
+    items, claimed, windows = [], set(), []
+    for record in records:
+        created = record.get("created")
+        if isinstance(created, (int, float)):
+            windows.append((created - 2, created + MATCH_WINDOW_S))
+        path = None
+        saved = record.get("output_path")
+        if saved:
+            candidate = Path(saved)
+            if candidate.is_file():
+                path = candidate
+        if path is None and history is not None and record.get("id"):
             try:
                 exact = [root / sub / name for sub, name in history(record["id"]) or ()]
             except Exception:
-                exact = []  # History is an optimization; mtime matching still works.
-        match = next((p for p in exact if p in known and p not in claimed), None)
-        if match is None:
-            match = next((p for mtime, p in videos if p not in claimed
-                          and record["created"] - 2 <= mtime <= record["created"] + MATCH_WINDOW_S), None)
-        if match is not None:
-            claimed.add(match)
-            meta[match] = record
-    items = []
-    for mtime, path in reversed(videos):
-        record = meta.get(path, {})
-        relative = path.relative_to(root)
+                exact = []
+            path = next((p for p in exact if p in known and p not in claimed), None)
+        if path is None and isinstance(created, (int, float)):
+            path = next((p for mtime, p in videos if p not in claimed
+                          and created - 2 <= mtime <= created + MATCH_WINDOW_S), None)
+        if path is None:
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        claimed.add(path)
         items.append({"id": relative.as_posix(), "file": path.name,
                       "subfolder": relative.parent.as_posix(), "type": "output",
                       "prompt_id": record.get("id"), "prompt": record.get("prompt"),
                       "mode": record.get("mode"), "profile": record.get("profile"),
                       "seed": record.get("seed"), "e2e_s": record.get("e2e_s"),
-                      "created": record.get("created", mtime)})
-        if len(items) >= limit:
-            break
-    return {"items": items}
+                      "created": record.get("created", path.stat().st_mtime)})
+
+    # MP4s no take claims: show them unless a take already explains that moment.
+    for mtime, path in videos:
+        if path in claimed or any(a <= mtime <= b for a, b in windows):
+            continue
+        relative = path.relative_to(root)
+        items.append({"id": relative.as_posix(), "file": path.name,
+                      "subfolder": relative.parent.as_posix(), "type": "output",
+                      "prompt_id": None, "prompt": None, "mode": None, "profile": None,
+                      "seed": None, "e2e_s": None, "created": mtime})
+
+    items.sort(key=lambda row: row["created"], reverse=True)
+    return {"items": items[:limit]}
+
+
+def list_sessions(output_root, limit=40):
+    """Take sessions newest first, so the Studio can continue any of them.
+
+    A session is the latents of one finished take: the Extend node pins its tail
+    window and renders the next segment from it.
+    """
+    root = Path(output_root).resolve()
+    records = {}
+    for record in _sidecars(root):
+        saved = record.get("session")
+        if not saved:
+            continue
+        try:
+            records[Path(saved).resolve().relative_to(root).as_posix()] = record
+        except (ValueError, OSError):
+            continue
+    items = []
+    for path in root.glob("sol_h3/*/request-*/session.session.safetensors"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        try:
+            key = path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
+        record = records.get(key, {})
+        video = None
+        for candidate in ("hyperflow.mp4", "hyperflow.delivered.mp4"):
+            if (path.parent / candidate).is_file():
+                video = candidate
+                break
+        items.append({"id": key, "session": str(path), "video": video,
+                      "output": record.get("output_path"),
+                      "mode": record.get("mode"), "prompt": record.get("prompt"),
+                      "profile": record.get("profile"), "seed": record.get("seed"),
+                      "created": record.get("created", stat.st_mtime)})
+    items.sort(key=lambda row: row["created"], reverse=True)
+    return {"items": items[:limit]}
 
 
 def video_path(output_root, identity):
     root = Path(output_root).resolve()
     path = (root / str(identity or "")).resolve()
-    path.relative_to(root / "SolH3")  # ValueError outside the Studio library.
+    path.relative_to(root)  # ValueError outside the output folder.
     if path.suffix != ".mp4" or not path.is_file():
         raise ValueError("Saved video unavailable")
     return path
@@ -74,9 +139,9 @@ def video_path(output_root, identity):
 def thumbnail(output_root, identity):
     """First frame as JPEG, cached; needs PyAV (ComfyUI's video dependency)."""
     path = video_path(output_root, identity)
-    cache = Path(output_root).resolve() / LIBRARY / "thumbs"
-    saved = cache / (path.relative_to(Path(output_root).resolve() / "SolH3").as_posix()
-                     .replace("/", "__") + ".jpg")
+    root = Path(output_root).resolve()
+    cache = root / LIBRARY / "thumbs"
+    saved = cache / (path.relative_to(root).as_posix().replace("/", "__") + ".jpg")
     if saved.is_file() and saved.stat().st_mtime >= path.stat().st_mtime:
         return saved.read_bytes()
     import av  # ImportError -> 404 at the route.
@@ -194,6 +259,15 @@ def register():
             raise web.HTTPBadRequest(text="limit must be an integer") from None
         rows = await asyncio.to_thread(list_videos, folder_paths.get_output_directory(),
                                        limit, lambda pid: list(history(pid)))
+        return web.json_response(rows, headers=no_store)
+
+    @routes.get("/solh3/sessions")
+    async def sessions(request):
+        try:
+            limit = max(1, min(200, int(request.query.get("limit", "40"))))
+        except ValueError:
+            raise web.HTTPBadRequest(text="limit must be an integer") from None
+        rows = await asyncio.to_thread(list_sessions, folder_paths.get_output_directory(), limit)
         return web.json_response(rows, headers=no_store)
 
     @routes.get("/solh3/library/thumbnail")
