@@ -71,12 +71,22 @@ With `setup.sh --skip-build`, place these directories (≈51 GB total):
 | `hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors` | HyperFlow LoRA | ModelScope `videorebirth/hyperflow` |
 | `sol-h3-vae/` | fast-VAE weights + code | ModelScope `Efficient-Large-Model/Sol-H3-VAE` |
 
+> **Warning**: the third argument of `hf upload` is the path *inside the repo* and must be a directory name. Using `.` flattens the local directory into the repo root — both DiT directories contain identically named files (config.json / 14 shards / adaln_table.pt), so the second upload silently overwrites the first.
+
 Upload prebuilt weights to HuggingFace (40 GB, hours — run inside tmux):
 
 ```bash
 hf auth login                  # token: https://huggingface.co/settings/tokens (Write scope)
-hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 .
-hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 .
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_hf8 transformer_hf8
+hf upload ZhenYaoWang/sol-h3-fp8-5090 /root/hyperflow/transformer_ref_hf8 transformer_ref_hf8
+```
+
+Move local backups out of the upload directories first:
+
+```bash
+mkdir -p /root/hyperflow/table-backups
+mv /root/hyperflow/transformer_hf8/*.bak-audio /root/hyperflow/table-backups/ 2>/dev/null
+mv /root/hyperflow/transformer_ref_hf8/*.bak-audio /root/hyperflow/table-backups/ 2>/dev/null
 ```
 
 Download prebuilt weights (pairs with `setup.sh --skip-build`):
