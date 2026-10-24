@@ -91,7 +91,7 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | backend | 下拉 | local | 保持 local |
 | resolution | 下拉 | 768p | 768p（66s）/ 480p（22s） |
 
-输出：`video_with_audio`（VIDEO，接预览/SaveVideo）、`timing_json`（STRING，计时明细）。
+输出：`video_with_audio`（VIDEO，接预览/SaveVideo）、`timing_json`（STRING，计时明细）、`session`（STRING，**第三个输出口**——每次生成都会落 `session.session.safetensors`，可直接接到 SolH3Extend 的 `.session` 输入，或留空由 Extend 自动续最新一条）。
 
 #### 2. SolH3Extend —— 续接节点
 
@@ -100,7 +100,7 @@ ComfyUI 菜单 → **Workflow → Browse Templates → Sol-H3**，或直接拖�
 | profile | 下拉 | — | 同上 |
 | prompt | 多行文本 | 示例文本 | 描述接下来发生什么 |
 | seed | 整数 | 43 | 换条时建议 +1 避免与上条相同 |
-| session | 文本 | 空 | **接上一条 Extend 节点的 session 输出口**（Generate 不输出 session），或直接粘 `.session.safetensors` 文件路径 |
+| session | 文本 | 空 | **接上一条 Generate 或 Extend 节点的 session 输出口（第三个输出）**，或直接粘 `.session.safetensors` 文件路径 |
 | window_frames | 整数 | 39 | 上一条尾部钉入上下文的帧数。推荐 39 或 90（共享音视频网格）；56/22/5 合法；范围 5–124 |
 | keep_loaded / resolution | — | 同 Generate | — |
 
