@@ -862,14 +862,19 @@ def serve(options, write_json):
                 # chain has a source; an `extend` request additionally pins one.
                 if options["hyperflow"].get("session_sidecar", True):
                     _EXTEND["session_target"] = str(_extend.session_path_for(request_dir))
+                    # The take's conditioning, frozen into its own directory: a later
+                    # take inherits this exact copy instead of rebuilding it from the
+                    # source, so a chain survives a restart, a replaced input file or
+                    # a cleared input folder (obvpm's artifact-over-recipe rule).
+                    frozen = _extend.freeze_references(request_dir, request.get("images") or [],
+                                                        request.get("audios") or [])
                     _EXTEND["session_meta"] = {
                         "self_id": case["case_id"], "prompt": case["prompt"],
                         "seed": str(case["seed"]), "profile": options["name"],
                         "resolution": str(request.get("resolution", "768p")),
                         "task": payload.get("task", case["task"]), "source_path": "",
-                        # What this take was conditioned on, so a later take that
-                        # inherits the references can tell they are the same ones.
-                        "references": json.dumps(request.get("references") or []),
+                        # The frozen copies this take was conditioned on.
+                        "references": json.dumps(frozen),
                     }
                 extend_request = request.get("extend")
                 if extend_request:

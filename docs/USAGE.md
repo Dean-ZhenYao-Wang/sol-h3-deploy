@@ -65,7 +65,7 @@ ComfyUI 里有三个使用入口：
 2. 切到 **Extend** 模式，顶部提示词框写新内容（描述接下来发生什么），点 Generate
 3. **续接窗口**chip 行选择钉入多少帧：39（默认）/ 90 为共享音视频网格（推荐）；56/22/5 合法但接缝机制不同
 4. **续接来源**下拉框选要接着的那一段：默认是刚生成的那条，也可以选任意历史片段（**可以从链条中段续接**，与节点图里「把某个 session 输出口接到 Extend」完全等价）。下拉数据来自 `GET /solh3/sessions`
-5. **可选**：给这一段上传自己的参考图/音频（Extend 模式下图片与音频上传区是开放的）——两段场景或任务不同时用；**留空则继承所续接那一段的参考**
+5. **可选**：给这一段上传自己的参考图/音频（Extend 模式下图片与音频上传区是开放的）——两段场景或任务不同时用；**留空则继承所续接那一段的参考**（继承的是那段冻结下来的副本，所以关机重启后照样能继承）
 6. 续接走 latent 级上下文（非像素重编码），59-66 秒/条，可无限链式
 
 ### 续接的参考继承与漂移防护
@@ -73,11 +73,19 @@ ComfyUI 里有三个使用入口：
 链条**默认继承**上一段的条件（与 obvpm 的模型一致）：
 
 - 续接时**不上传参考** → 沿用父片段当初用的参考图/音频（引擎侧走 ref2va，而不是退化成纯文本）
-- 每条片段都把"自己是用哪些参考做的"记进 session sidecar：参考文件的**路径 + sha256 指纹**
-- 继承时校验指纹：文件**被改过**或**不见了** → 直接报错拒绝，并指名道姓说是哪个文件
+- 想换参考就在 Extend 模式上传新的，新片段会记录新的参考
+- 继承时校验指纹：条件文件**被改过**或**不见了** → 直接报错拒绝，并指名道姓说是哪个文件
   （obvpm 的原则：*An artifact fails loudly; a recipe fails quietly* —— 条件悄悄变了，要等接缝不对劲才看得出来）
-- 想换参考就在 Extend 模式上传新的，新片段会记录新的指纹
-- 指纹存放在 `output/sol_h3/<uuid>/request-NNNNN/session.session.safetensors` 的 metadata（`references` 字段），随片段一起走
+
+条件不是"配方"，而是**随片段走的产物**：每条片段都把自己用的参考**冻结**进自己的目录
+（`output/sol_h3/<uuid>/request-NNNNN/refs/`），指纹与来源记在 session sidecar 的 metadata
+（`references` 字段）里。继承时读的是这份冻结副本，不是原始文件。
+
+因此这条链：
+
+- **关机重启后照样能续** —— 条件在链条自己的目录里，不依赖 `input/` 里的原始文件
+- **原始参考被覆盖/删掉也不影响** —— 冻结副本才是真身，`source` 字段只留作来源说明
+- **不会悄悄换素材** —— 冻结副本被动过（指纹不符）或丢失 → 指名报错拒绝，绝不退回"重新读原始文件"
 
 ### 保存位置（两种模式都能指定）
 
@@ -238,9 +246,9 @@ obvpm（节点菜单搜 `obvpm`）是官方核生态的导演台：时间线、E
 | `/root/Sana/models/minimax_h3/HyperFlow/` | HyperFlow 依赖（`deps` 指向它） |
 | `/root/ComfyUI/` | ComfyUI 本体（v0.42）+ custom_nodes/（obvpm 等 7 个包） |
 | `/root/ComfyUI/input/` | **你的参考素材**（LoadImage / LoadAudio 从这里取，Studio 上传也落这里） |
-| `/root/ComfyUI/input/solh3_refs/` | 节点图接线进来的素材落地点（自动生成，可删） |
+| `/root/ComfyUI/input/solh3_refs/` | 节点图接线进来的素材落地点（**运行中会生成，跑完自动清空**，可随时删） |
 | `/root/ComfyUI/output/SolH3/<模式>/` | **成片**（默认保存位置；`output_dir`/`filename` 可改，Studio 作品库收录这里） |
-| `/root/ComfyUI/output/sol_h3/<uuid>/request-NNNNN/` | 引擎工作目录：session 潜变量（`session.session.safetensors`）、worker 日志、原始 MP4 |
+| `/root/ComfyUI/output/sol_h3/<uuid>/request-NNNNN/` | 引擎工作目录：session 潜变量（`session.session.safetensors`）、**`refs/` 冻结的条件副本**、worker 日志、原始 MP4 |
 | `/root/p0f_light.py` | AdaLN 补表工具（见排障） |
 | `/model/ModelScope/MiniMax/MiniMax-H3/` | 原始 BF16 权重（只读网络盘，勿占本地空间拷贝） |
 
@@ -248,7 +256,7 @@ obvpm（节点菜单搜 `obvpm`）是官方核生态的导演台：时间线、E
 
 - 根盘 79G：权重 44G（两个 FP8 DiT）+ VAE 6.1G + 运行时约 1.2G，**可自由空间约 20G**
 - 可以随时删：`/root/ComfyUI/input/solh3_refs/`、`/root/ComfyUI/output/SolH3/` 里的旧成片、`~/.cache/`
-- **删前先想清楚**：`output/sol_h3/<uuid>/` 里的 `session.session.safetensors` 是**续接的潜空间**——删掉后 Studio 的「续接来源」里就再也选不到那一条了；`hyperflow.delivered.mp4` 是裁掉钉入头部的续接片段，严格链式拼时间线要用它
+- **删前先想清楚**：`output/sol_h3/<uuid>/` 里的 `session.session.safetensors` 是**续接的潜空间**——删掉后 Studio 的「续接来源」里就再也选不到那一条了；同一目录下的 **`refs/` 是这段的条件副本**（冻结的参考图/音频），删掉它，下一次续接就会报"条件不见了"而拒绝续（这是有意的：宁可停下也不悄悄换素材）；`hyperflow.delivered.mp4` 是裁掉钉入头部的续接片段，严格链式拼时间线要用它
 - 重建 FP8 / 补 AdaLN 表前先 `df -h`：构建过程要吃临时空间
 
 ## 日常运维
@@ -296,3 +304,4 @@ pkill -f "main.py"; sleep 3; bash /root/launch_comfy.sh
 8. **原生参考素材口**：comfy_nodes.py 的 `image_input`(IMAGE) / `audio_1…3`(AUDIO)——节点图可直接拉 `LoadImage` / `LoadAudio` 接线，节点内部落文件再交引擎
 9. **续接带参考素材（ref2va + 尾窗）**：hyperflow_worker.py 放开「续接只走文本条件」的护栏，有参考时走 ref2va（参考 DiT + 参考条件行），尾窗行仍钉在生成段头部；scheduler hook 的音频行偏移改为按生成行计（`(audio.shape[0] - nca) // 2`），否则带音频参考时 ch1 写入越界
 10. **参考继承与漂移防护（对齐 obvpm）**：每条片段把参考文件路径 + sha256 指纹写进 session sidecar 的 `references`；续接未提供参考时**继承父片段的参考**（obvpm 语义），继承前校验指纹，文件被改或消失则**指名报错拒绝**，不静默换素材
+11. **条件冻结成产物（obvpm 的 artifact 而非 recipe）**：`extend.py` 的 `freeze_references()`——引擎把这一段用的参考图/音频**复制进这一段自己的目录** `request-NNNNN/refs/`，指纹与来源写进 session metadata。继承读的是这份冻结副本，因此**关机重启、原始文件被覆盖或 `input/` 被清空，链条照样能续**；副本被动过或丢失则指名报错拒绝。节点侧 `comfy_nodes.py` 负责跑完后清掉 `input/solh3_refs/` 的临时物化副本

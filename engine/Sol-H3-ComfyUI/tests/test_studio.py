@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from test_bridge import FAKE, ROOT, bridge
-from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config
+from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config, extend as engine_extend
 
 # Records each request the fake pipeline sees, and writes a worker progress file.
 RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
@@ -255,7 +255,7 @@ class StudioReferences(unittest.TestCase):
                 comfy_nodes.inherited_references(str(sidecar))
             # A missing file is refused too.
             image.unlink()
-            with self.assertRaisesRegex(ValueError, "which is gone"):
+            with self.assertRaisesRegex(ValueError, "never rebuilds its conditioning"):
                 comfy_nodes.inherited_references(str(sidecar))
 
     def test_extend_takes_wired_references(self):
@@ -278,6 +278,82 @@ class StudioReferences(unittest.TestCase):
             comfy_nodes.check_images("first_frame", 2)
         self.assertIsNone(comfy_nodes.check_images("reference", 1))
         self.assertIsNone(comfy_nodes.check_images("text", 0))
+
+
+class FrozenConditioning(unittest.TestCase):
+    """A take's conditioning is frozen into its own directory: an artifact, not a recipe."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source.png"
+        self.source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        self.audio = self.root / "voice.wav"
+        self.audio.write_bytes(b"RIFF" + b"sound")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_freeze_copies_the_media_next_to_the_take(self):
+        take = self.root / "request-00001"
+        records = engine_extend.freeze_references(take, [self.source], [self.audio])
+        self.assertEqual([r["kind"] for r in records], ["image", "audio"])
+        for record in records:
+            frozen = Path(record["path"])
+            self.assertTrue(frozen.is_file())
+            self.assertEqual(frozen.parent, take / "refs")
+            self.assertEqual(frozen.read_bytes(), Path(record["source"]).read_bytes())
+            self.assertEqual(record["sha256"], engine_extend.file_digest(str(frozen)))
+        self.assertEqual((take / "refs" / "ref_01.png").name, "ref_01.png")
+        self.assertEqual((take / "refs" / "audio_01.wav").name, "audio_01.wav")
+
+    def test_a_take_inherits_the_frozen_copy_not_the_source(self):
+        take = self.root / "request-00001"
+        records = engine_extend.freeze_references(take, [self.source], [])
+        # The source is gone (input folder cleared): the chain still holds its copy.
+        self.source.unlink()
+        session = take / "session.session.safetensors"
+        from safetensors.torch import save_file
+        save_file({"video": torch_zeros(), "audio": torch_zeros()},
+                  str(session),
+                  metadata={"format": engine_extend.SESSION_FORMAT,
+                            "references": json.dumps(records)})
+        images, audios = comfy_nodes.inherited_references(str(session))
+        self.assertEqual(len(images), 1)
+        self.assertEqual(audios, [])
+        self.assertTrue(Path(images[0]).is_file())
+        self.assertEqual(Path(images[0]).parent, take / "refs")
+
+    def test_a_missing_artifact_is_refused_by_name(self):
+        take = self.root / "request-00001"
+        records = engine_extend.freeze_references(take, [self.source], [])
+        Path(records[0]["path"]).unlink()
+        session = take / "session.session.safetensors"
+        from safetensors.torch import save_file
+        save_file({"video": torch_zeros(), "audio": torch_zeros()},
+                  str(session),
+                  metadata={"format": engine_extend.SESSION_FORMAT,
+                            "references": json.dumps(records)})
+        with self.assertRaisesRegex(ValueError, "never rebuilds its conditioning"):
+            comfy_nodes.inherited_references(str(session))
+
+    def test_a_changed_artifact_is_refused_by_name(self):
+        take = self.root / "request-00001"
+        records = engine_extend.freeze_references(take, [self.source], [])
+        Path(records[0]["path"]).write_bytes(b"tampered")
+        session = take / "session.session.safetensors"
+        from safetensors.torch import save_file
+        save_file({"video": torch_zeros(), "audio": torch_zeros()},
+                  str(session),
+                  metadata={"format": engine_extend.SESSION_FORMAT,
+                            "references": json.dumps(records)})
+        with self.assertRaisesRegex(ValueError, "has changed since"):
+            comfy_nodes.inherited_references(str(session))
+
+
+def torch_zeros():
+    import torch
+    return torch.zeros((1, 24, 1, 4, 4))
 
 
 if __name__ == "__main__":

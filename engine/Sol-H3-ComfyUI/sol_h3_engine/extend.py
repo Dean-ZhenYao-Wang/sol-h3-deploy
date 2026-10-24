@@ -160,6 +160,35 @@ def file_digest(path):
         return ""
 
 
+def freeze_references(request_dir, images=(), audios=()):
+    """Copy a take's reference media into the take's own directory.
+
+    obvpm's rule, adapted to this engine: a chain's conditioning is an *artifact*
+    that lives with the take, not a recipe that has to be rebuilt. The engine
+    freezes the files it was handed into ``<request_dir>/refs/`` and records
+    their digests, so a later take picks up the very same conditioning -- after a
+    restart, after the source file was replaced, or after the input folder was
+    cleared. The source path is kept only as provenance.
+
+    Returns the records that go into the session sidecar's metadata.
+    """
+    import shutil
+    records = []
+    folder = Path(request_dir) / "refs"
+    for kind, paths, prefix in (("image", images, "ref"), ("audio", audios, "audio")):
+        for index, source in enumerate(paths, 1):
+            source = Path(source)
+            if not source.is_file():
+                raise ValueError("Reference file not found: %s" % source)
+            suffix = source.suffix.lower() or (".png" if kind == "image" else ".wav")
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / ("%s_%02d%s" % (prefix, index, suffix))
+            shutil.copyfile(str(source), str(target))
+            records.append({"kind": kind, "path": str(target),
+                            "sha256": file_digest(str(target)), "source": str(source)})
+    return records
+
+
 def write_session(path, video, audio, meta):
     """Atomic session write: tmp file + os.replace (MP4 first, then this)."""
     from safetensors.torch import save_file

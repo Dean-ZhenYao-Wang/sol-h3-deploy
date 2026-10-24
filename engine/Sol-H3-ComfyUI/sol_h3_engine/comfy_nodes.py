@@ -44,16 +44,42 @@ def resolve_images(image):
     return paths
 
 
-def reference_folder():
-    """A scratch folder for materialised references: ComfyUI's input dir, or a temp dir off ComfyUI."""
+def reference_root():
+    """Where materialised references live: ComfyUI's input dir, or a temp dir off ComfyUI."""
     try:
         import folder_paths
         base = Path(folder_paths.get_input_directory())
     except Exception:
         base = Path(tempfile.gettempdir())
-    folder = base / "solh3_refs"
+    return base / "solh3_refs"
+
+
+def reference_folder():
+    """A scratch folder for materialised references: ComfyUI's input dir, or a temp dir off ComfyUI."""
+    folder = reference_root()
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def scratch_copies(paths):
+    """The temporary copies this node made under solh3_refs/ (the user's own files never match)."""
+    try:
+        base = reference_root().resolve()
+    except OSError:
+        return []
+    folders = []
+    for path in paths:
+        parent = Path(path).resolve().parent
+        if parent.parent == base and parent not in folders:
+            folders.append(parent)
+    return folders
+
+
+def drop_scratch_copies(paths):
+    """Remove the temporary copies: the engine froze them into the take by now."""
+    import shutil
+    for folder in scratch_copies(paths):
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def materialize_images(image_input):
@@ -141,20 +167,6 @@ def collect_references(mode, image, audio, image_input=None, audio_slots=()):
     return images, audios
 
 
-def reference_records(images, audios):
-    """What a take was conditioned on: the files and their digests.
-
-    obvpm's rule, adapted: the take records the artifact, so a later take that
-    inherits the references can tell whether they are still the same ones.
-    """
-    records = []
-    for kind, paths in (("image", images), ("audio", audios)):
-        for path in paths:
-            records.append({"kind": kind, "path": str(path),
-                            "sha256": _extend.file_digest(path)})
-    return records
-
-
 def read_session_references(session_path):
     """The reference records a take stored in its session sidecar."""
     from safetensors import safe_open
@@ -178,27 +190,33 @@ def read_session_references(session_path):
 
 
 def inherited_references(session_path):
-    """The parent take's own references, verified against their digests.
+    """The parent take's stored conditioning: the copies it froze for itself.
 
     obvpm's model: a chain inherits the conditioning of the take it continues,
-    and a file that changed under it is refused by name rather than quietly
-    swapped for a new one.
+    and that conditioning is an artifact, not a recipe. The take froze its
+    reference media into its own directory, so a later take picks up the very
+    same files -- after a restart, after the source file moved on, after the
+    input folder was cleared. A missing artifact is refused by name: a chain
+    never silently rebuilds its conditioning.
     """
     images, audios = [], []
     for record in read_session_references(session_path):
         path = str(record.get("path") or "")
         kind = str(record.get("kind") or "image")
         if not path or not os.path.isfile(path):
-            raise ValueError("The take this extends was conditioned on %s, which is gone. "
-                             "Attach the reference again to continue."
-                             % (path or "an unnamed file"))
-        digest = _extend.file_digest(path)
+            raise ValueError(
+                "The take this extends stored its conditioning at %s, and that file is gone. "
+                "A chain never rebuilds its conditioning silently: restore the file, or "
+                "attach the reference again to continue with a new one."
+                % (path or "an unnamed file"))
         expected = str(record.get("sha256") or "")
+        digest = _extend.file_digest(path)
         if expected and digest != expected:
-            raise ValueError("The take this extends was conditioned on %s, and that file has "
-                             "changed since (digest %s, was %s). Attach the reference again to "
-                             "continue with the new one, or restore the file."
-                             % (path, digest[:12], expected[:12]))
+            raise ValueError(
+                "The take this extends stored its conditioning at %s, and that file has "
+                "changed since (digest %s, was %s). Restore it, or attach the reference "
+                "again to continue with a new one."
+                % (path, digest[:12], expected[:12]))
         (images if kind == "image" else audios).append(path)
     return images, audios
 
@@ -395,9 +413,9 @@ class SolH3Generate:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
                                          mode=mode, images=images, audios=audios, extend=extend,
-                                         references=reference_records(images, audios),
                                          progress=progress, resolution=resolution)
             finally:
+                drop_scratch_copies(images + audios)
                 if not keep_loaded:
                     bridge.close()
             publish(node, prompt_id, "saving", started, steps=steps)
@@ -529,11 +547,11 @@ class SolH3Extend:
                 result = bridge.generate(settings, output_root, prompt, seed,
                                          cancel=mm.throw_exception_if_processing_interrupted,
                                          mode=mode, images=images, audios=audios,
-                                         references=reference_records(images, audios),
                                          progress=progress, resolution=resolution,
                                          extend={"session": session.strip(),
                                                  "window_frames": int(window_frames)})
             finally:
+                drop_scratch_copies(images + audios)
                 if not keep_loaded:
                     bridge.close()
             publish(node, prompt_id, "saving", started, steps=steps)
