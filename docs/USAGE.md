@@ -205,19 +205,36 @@ obvpm（节点菜单搜 `obvpm`）是官方核生态的导演台：时间线、E
 | 路径 | 内容 |
 |---|---|
 | `/root/launch_comfy.sh` | **启动脚本**（唯一入口） |
-| `/root/README.md` | 本文件 |
+| `/root/README.md` | 本文件（= 仓库里的 `docs/USAGE.md`，两边同步） |
+| `/root/solh3-deploy/` | **部署仓库**（GitHub：`Dean-ZhenYao-Wang/sol-h3-deploy`；含 engine/ config/ scripts/ setup/ docs/） |
+| `/root/solh3-deploy/scripts/hf/` | HF 权重上传/校验工具（重建 FP8 后可重传：`hf_fix_upload.sh` 等） |
+| `/root/solh3-deploy/docs/hf-manifest.json` | HF 仓库每个文件的 SHA256 清单（上传后逐文件比对用） |
 | `/root/sol-h3-settings-final/config.json` | 引擎配置（profile 定义，SOL_ENGINE_CONFIG 指向它） |
+| `/root/sol-h3-settings-final/paths.json` | 运行时路径表（**FastVideo / LTX-2 / FA4 / 模型路径都在这里**） |
+| `/root/h3_runtime_venv/` | 引擎侧 Python 运行时（所有 profile 的 `python` 都指向它） |
+| `/root/sol-h3-runtime/` | FastVideo + LTX-2 源码（`paths.json` 的 fastvideo_root / ltx_root，**fp8/bf16 profile 依赖，勿删**） |
+| `/root/fa4_root/` | FlashAttention-4 隔离依赖（`paths.json` 的 fa4_root，**别删**） |
 | `/root/hyperflow/transformer_hf8/` | 主 DiT FP8 权重（20G）+ AdaLN 查表 |
 | `/root/hyperflow/transformer_ref_hf8/` | 参考图 DiT FP8 权重（20G）+ AdaLN 查表 |
 | `/root/hyperflow/minimax_h3_hyperflow_8step_v1.0.safetensors` | HyperFlow LoRA（运行时加载，勿删） |
 | `/root/hyperflow/inductor_cache/` | 编译缓存（删了会多等几分钟，别删） |
 | `/root/sol-h3-vae/` | fast-VAE 解码器权重（6.1G） |
 | `/root/Sana/models/minimax_h3/Sol-H3-ComfyUI/` | **引擎源码**（sol_h3_engine/ 是 ComfyUI 插件；example_workflows/ 有示例） |
+| `/root/Sana/models/minimax_h3/HyperFlow/` | HyperFlow 依赖（`deps` 指向它） |
 | `/root/ComfyUI/` | ComfyUI 本体（v0.42）+ custom_nodes/（obvpm 等 7 个包） |
+| `/root/ComfyUI/input/` | **你的参考素材**（LoadImage / LoadAudio 从这里取，Studio 上传也落这里） |
+| `/root/ComfyUI/input/solh3_refs/` | 节点图接线进来的素材落地点（自动生成，可删） |
 | `/root/ComfyUI/output/SolH3/<模式>/` | **成片**（默认保存位置；`output_dir`/`filename` 可改，Studio 作品库收录这里） |
 | `/root/ComfyUI/output/sol_h3/<uuid>/request-NNNNN/` | 引擎工作目录：session 潜变量（`session.session.safetensors`）、worker 日志、原始 MP4 |
 | `/root/p0f_light.py` | AdaLN 补表工具（见排障） |
 | `/model/ModelScope/MiniMax/MiniMax-H3/` | 原始 BF16 权重（只读网络盘，勿占本地空间拷贝） |
+
+### 磁盘与清理
+
+- 根盘 79G：权重 44G（两个 FP8 DiT）+ VAE 6.1G + 运行时约 1.2G，**可自由空间约 20G**
+- 可以随时删：`/root/ComfyUI/input/solh3_refs/`、`/root/ComfyUI/output/SolH3/` 里的旧成片、`~/.cache/`
+- **删前先想清楚**：`output/sol_h3/<uuid>/` 里的 `session.session.safetensors` 是**续接的潜空间**——删掉后 Studio 的「续接来源」里就再也选不到那一条了；`hyperflow.delivered.mp4` 是裁掉钉入头部的续接片段，严格链式拼时间线要用它
+- 重建 FP8 / 补 AdaLN 表前先 `df -h`：构建过程要吃临时空间
 
 ## 日常运维
 
