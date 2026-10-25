@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 from test_bridge import FAKE, ROOT, bridge
-from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config, extend as engine_extend
+from sol_engine_test.sol_h3_engine import (comfy_nodes, comfy_routes, config,
+                                         extend as engine_extend,
+                                         condition_artifact as engine_artifact)
 
 # Records each request the fake pipeline sees, and writes a worker progress file.
 RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
@@ -351,9 +353,83 @@ class FrozenConditioning(unittest.TestCase):
             comfy_nodes.inherited_references(str(session))
 
 
-def torch_zeros():
+def torch_zeros(shape=(1, 24, 1, 4, 4)):
     import torch
-    return torch.zeros((1, 24, 1, 4, 4))
+    return torch.zeros(shape)
+
+
+
+class ConditionArtifact(unittest.TestCase):
+    """The encoded conditioning, stored and loaded as an artifact."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_save_and_load_round_trip(self):
+        import torch
+        conditions = [torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2),
+                      torch.ones(1, 3, 1, 4, 4)]
+        audios = [torch.zeros(8, 32)]
+        path = self.root / "refs" / "conditioning.safetensors"
+        record = engine_artifact.save(path, conditions, audios, media="abc")
+        self.assertTrue(path.is_file())
+        self.assertEqual(record["conditions"], 2)
+        self.assertEqual(record["audios"], 1)
+        self.assertEqual(record["media"], "abc")
+        loaded = engine_artifact.load(path)
+        self.assertEqual(len(loaded["conditions"]), 2)
+        self.assertEqual(len(loaded["audios"]), 1)
+        for original, restored in zip(conditions, loaded["conditions"]):
+            self.assertTrue(torch.equal(original, restored))
+
+    def test_load_refuses_a_foreign_file(self):
+        from safetensors.torch import save_file
+        path = self.root / "foreign.safetensors"
+        save_file({"x": torch_zeros()}, str(path), metadata={"format": "something-else"})
+        self.assertIsNone(engine_artifact.load(path))
+        self.assertIsNone(engine_artifact.load(self.root / "missing.safetensors"))
+
+    def test_media_digest_follows_the_content_not_the_path(self):
+        first = self.root / "a" / "ref.png"
+        second = self.root / "b" / "ref.png"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_bytes(b"same pixels")
+        second.write_bytes(b"same pixels")
+        other = self.root / "c.png"
+        other.write_bytes(b"other pixels")
+        self.assertEqual(engine_artifact.media_digest([str(first)]),
+                         engine_artifact.media_digest([str(second)]))
+        self.assertNotEqual(engine_artifact.media_digest([str(first)]),
+                            engine_artifact.media_digest([str(other)]))
+
+    def test_a_take_reads_the_artifact_of_its_parent(self):
+        from safetensors.torch import save_file
+        artifact = self.root / "conditioning.safetensors"
+        engine_artifact.save(artifact, [torch_zeros()], [], media="m")
+        record = {"path": str(artifact), "sha256": "x", "media": "m",
+                  "conditions": 1, "audios": 0}
+        session = self.root / "session.session.safetensors"
+        save_file({"video": torch_zeros((1, 24, 1, 4, 4)), "audio": torch_zeros((2, 32, 1))},
+                  str(session),
+                  metadata={"format": "solx-v1",
+                            "references": json.dumps([]),
+                            "condition_artifact": json.dumps(record)})
+        found = comfy_nodes.inherited_artifact(str(session))
+        self.assertIsNotNone(found)
+        self.assertEqual(found["path"], str(artifact))
+        # A take without an artifact simply has none.
+        plain = self.root / "plain.session.safetensors"
+        save_file({"video": torch_zeros((1, 24, 1, 4, 4)), "audio": torch_zeros((2, 32, 1))},
+                  str(plain), metadata={"format": "solx-v1"})
+        self.assertIsNone(comfy_nodes.inherited_artifact(str(plain)))
+        # An artifact whose file is gone is not handed on.
+        Path(record["path"]).unlink()
+        self.assertIsNone(comfy_nodes.inherited_artifact(str(session)))
 
 
 if __name__ == "__main__":

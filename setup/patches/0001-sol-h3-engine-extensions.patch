@@ -12,7 +12,7 @@ index 7833448..59f325b 100644
  
  def fetch(url, path):
 diff --git a/sol_h3_engine/bridge.py b/sol_h3_engine/bridge.py
-index 3788913..7ffa741 100644
+index 3788913..35f5388 100644
 --- a/sol_h3_engine/bridge.py
 +++ b/sol_h3_engine/bridge.py
 @@ -40,8 +40,8 @@ class EngineProcess:
@@ -22,47 +22,50 @@ index 3788913..7ffa741 100644
 -    def generate(self, prompt, seed, decoder="original", cancel=None, mode="text", images=(),
 -                 progress=None, resolution="768p"):
 +    def generate(self, prompt, seed, decoder="original", cancel=None, mode="text", images=(), audios=(),
-+                 progress=None, resolution="768p", extend=None):
++                 progress=None, resolution="768p", extend=None, condition_artifact=None):
          self.sequence += 1
          response = self.root / ("response-%05d.json" % self.sequence)
          # A worker MAY write stage/step updates here; absence is normal.
-@@ -49,8 +49,11 @@ class EngineProcess:
+@@ -49,8 +49,13 @@ class EngineProcess:
          command = {"op": "generate", "prompt": prompt, "seed": seed,
                     "decoder": decoder, "response": str(response),
                     "case_id": "request-%05d" % self.sequence,
 -                   "mode": mode, "images": [str(path) for path in images], "resolution": resolution,
 +                   "mode": mode, "images": [str(path) for path in images],
 +                   "audios": [str(path) for path in audios], "resolution": resolution,
++                   # The encoded conditioning this request may reuse (the parent's artifact).
++                   "condition_artifact": str(condition_artifact) if condition_artifact else "",
                     "progress": str(progress_file)}
 +        if extend:
 +            command["extend"] = dict(extend)
          started = time.monotonic()
          reported = 0.0
          try:
-@@ -117,7 +120,7 @@ _key = None
+@@ -117,7 +122,8 @@ _key = None
  
  
  def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode="text",
 -             images=(), progress=None, resolution="768p"):
-+             images=(), audios=(), progress=None, resolution="768p", extend=None):
++             images=(), audios=(), progress=None, resolution="768p", extend=None,
++             condition_artifact=None):
      global _engine, _key
      # One resident model session. Switching precision/decoder releases the old one.
      decoder = decoder or profile.get("decoder", "original")
-@@ -131,7 +134,8 @@ def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode
+@@ -131,7 +137,8 @@ def generate(profile, output_root, prompt, seed, decoder=None, cancel=None, mode
              _key = key
          try:
              return _engine.generate(prompt, seed, decoder, cancel, mode=mode, images=images,
 -                                    progress=progress, resolution=resolution)
 +                                    audios=audios, progress=progress, resolution=resolution,
-+                                    extend=extend)
++                                    extend=extend, condition_artifact=condition_artifact)
          except BaseException:
              _engine = None
              _key = None
 diff --git a/sol_h3_engine/comfy_nodes.py b/sol_h3_engine/comfy_nodes.py
-index e1b29ae..5162213 100644
+index e1b29ae..e916f2d 100644
 --- a/sol_h3_engine/comfy_nodes.py
 +++ b/sol_h3_engine/comfy_nodes.py
-@@ -2,13 +2,17 @@
+@@ -2,13 +2,18 @@
  import json
  import os
  from pathlib import Path
@@ -72,6 +75,7 @@ index e1b29ae..5162213 100644
  
  from . import bridge
 +from . import extend as _extend
++from . import condition_artifact as _artifact
  from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
  
 -MODES = ["text", "first_frame", "reference"]
@@ -82,7 +86,7 @@ index e1b29ae..5162213 100644
  BACKENDS = ["local"]
  # Latest update per node for GET /solh3/progress (polling fallback for reloads).
  PROGRESS = {}
-@@ -40,7 +44,185 @@ def resolve_images(image):
+@@ -40,7 +45,215 @@ def resolve_images(image):
      return paths
  
  
@@ -264,12 +268,42 @@ index e1b29ae..5162213 100644
 +    return images, audios
 +
 +
++def inherited_artifact(session_path):
++    """The parent's encoded conditioning artifact, if it stored one.
++
++    obvpm's `condload` in one piece: the artifact *is* the conditioning, so a
++    take that continues the chain can reuse the very latents the parent was
++    built on. The artifact belongs to the media it was made from, so it is only
++    handed on when the media is inherited unchanged.
++    """
++    from safetensors import safe_open
++    path = Path(session_path or "")
++    if not path.is_file():
++        return None
++    try:
++        with safe_open(str(path), framework="pt") as handle:
++            raw = (handle.metadata() or {}).get("condition_artifact")
++    except Exception:
++        return None
++    if not raw:
++        return None
++    try:
++        record = json.loads(raw)
++    except ValueError:
++        return None
++    if not isinstance(record, dict) or not record.get("path"):
++        return None
++    if not os.path.isfile(record["path"]):
++        return None
++    return record
++
++
 +def check_request(profile, mode, backend, resolution="768p"):
 +    """Profile, mode and resolution rules; the image count is checked once known."""
      if backend not in BACKENDS:
          raise ValueError("Unknown backend: %s" % backend)
      if mode not in MODES:
-@@ -49,20 +231,90 @@ def check_request(profile, mode, image, backend, resolution="768p"):
+@@ -49,20 +262,90 @@ def check_request(profile, mode, image, backend, resolution="768p"):
          raise ValueError("Unknown resolution: %s" % resolution)
      if resolution not in profile_resolutions(profile):
          raise ValueError("This pipeline renders %s only" % ", ".join(profile_resolutions(profile)))
@@ -369,7 +403,7 @@ index e1b29ae..5162213 100644
                "prompt": result.get("prompt"), "mode": mode, "profile": result.get("profile"),
                "seed": seed, "resolution": resolution, "e2e_s": result.get("e2e_s"), "created": time.time()}
      temporary = folder / (prompt_id + ".tmp")
-@@ -88,14 +340,22 @@ class SolH3Generate:
+@@ -88,14 +371,22 @@ class SolH3Generate:
              "keep_loaded": ("BOOLEAN", {"default": True}),
          }, "optional": {
              # Optional with defaults so workflows saved before Studio still load.
@@ -395,7 +429,7 @@ index e1b29ae..5162213 100644
      FUNCTION = "generate"
      CATEGORY = "Sol Engine"
      OUTPUT_NODE = True
-@@ -105,17 +365,32 @@ class SolH3Generate:
+@@ -105,17 +396,32 @@ class SolH3Generate:
          # Every queued request must run: never time a ComfyUI cache hit.
          return float("nan")
  
@@ -432,7 +466,7 @@ index e1b29ae..5162213 100644
          node, prompt_id, started = unique_id, current_prompt_id() or "", time.monotonic()
          publish(node, prompt_id, "queued", started)
          output_root = folder_paths.get_output_directory()
-@@ -137,11 +412,14 @@ class SolH3Generate:
+@@ -137,11 +443,14 @@ class SolH3Generate:
              try:
                  result = bridge.generate(settings, output_root, prompt, seed,
                                           cancel=mm.throw_exception_if_processing_interrupted,
@@ -448,7 +482,7 @@ index e1b29ae..5162213 100644
              if prompt_id:
                  write_sidecar(output_root, prompt_id, result, mode, seed, resolution)
          except BaseException as error:
-@@ -155,8 +433,10 @@ class SolH3Generate:
+@@ -155,8 +464,10 @@ class SolH3Generate:
          # Lets Studio show the engine MP4 at once (and in graphs without SaveVideo).
          relative = Path(result["output"]).resolve().relative_to(Path(output_root).resolve())
          video = {"filename": relative.name, "subfolder": relative.parent.as_posix(), "type": "output"}
@@ -460,7 +494,7 @@ index e1b29ae..5162213 100644
  
  
  class SolH3Release:
-@@ -178,6 +458,121 @@ class SolH3Release:
+@@ -178,6 +489,130 @@ class SolH3Release:
          return (after,)
  
  
@@ -525,10 +559,18 @@ index e1b29ae..5162213 100644
 +        # images and audio, while the pinned window keeps the seam continuous.
 +        images, audios = collect_references("reference", image, audio, image_input,
 +                                            (audio_1, audio_2, audio_3))
++        artifact = None
 +        if not images and not audios:
 +            # obvpm's model: the chain inherits the conditioning of the take it
 +            # continues. Attach references to replace it.
 +            images, audios = inherited_references(session)
++            artifact = inherited_artifact(session)
++            if artifact:
++                # The artifact is the parent's encoding of *its* media; it only
++                # applies while the media is the same one.
++                media = _artifact.media_digest(images + audios)
++                if media != artifact.get("media"):
++                    artifact = None
 +        mode = "reference" if images else "text"
 +        check_request(profile, mode, "local", resolution)
 +        from comfy_api.latest import InputImpl
@@ -555,6 +597,7 @@ index e1b29ae..5162213 100644
 +                                         cancel=mm.throw_exception_if_processing_interrupted,
 +                                         mode=mode, images=images, audios=audios,
 +                                         progress=progress, resolution=resolution,
++                                         condition_artifact=(artifact or {}).get("path"),
 +                                         extend={"session": session.strip(),
 +                                                 "window_frames": int(window_frames)})
 +            finally:
@@ -771,6 +814,205 @@ index d5e6876..124b4ea 100644
      @routes.get("/solh3/library/thumbnail")
      async def preview(request):
          try:
+diff --git a/sol_h3_engine/condition_artifact.py b/sol_h3_engine/condition_artifact.py
+new file mode 100644
+index 0000000..db29215
+--- /dev/null
++++ b/sol_h3_engine/condition_artifact.py
+@@ -0,0 +1,193 @@
++"""The take's encoded conditioning, stored as an artifact.
++
++obvpm's rule: a chain's conditioning is an *artifact*, not a recipe. The media
++copies beside the session (`refs/`) are the portable half -- the bytes the
++reference came from. This is the exact half: the latents the pipeline actually
++conditioned on, i.e. the video VAE's encoding of every reference image and the
++audio VAE's encoding of every reference soundtrack.
++
++Why both halves matter: the media copy keeps the chain alive after a restart
++and after the source file is gone; the encoded copy keeps the chain on *the
++conditioning it was built on* even if the encoding code moves under it, and
++saves re-running the VAEs when the next take continues the chain.
++
++The artifact is a safetensors file next to the take:
++
++    refs/conditioning.safetensors
++        condition_00 ... one tensor per reference condition (image or video)
++        audio_00 ...    one tensor per audio-bearing reference
++        metadata: format, the media digest it belongs to, the counts
++
++The pipeline side is one hook: the official `MiniMaxH3Ref2VAReferenceEncoderStep`
++encodes every reference through the VAEs; when a request carries an artifact,
++the step hands it the stored latents instead and the encoders stay out of it.
++That is the same seam obvpm's `condload` uses.
++"""
++import json
++import os
++from pathlib import Path
++
++FORMAT = "solh3-cond-v1"
++FILENAME = "conditioning.safetensors"
++
++# The request in flight: the artifact it may reuse, and what happened.
++_CURRENT = {"path": None, "used": None, "fallback": None}
++
++
++def _digest(path):
++    import hashlib
++    try:
++        digest = hashlib.sha256()
++        with open(path, "rb") as handle:
++            for chunk in iter(lambda: handle.read(1 << 20), b""):
++                digest.update(chunk)
++        return digest.hexdigest()
++    except OSError:
++        return ""
++
++
++def media_digest(paths):
++    """One digest for a set of reference files: the identity of a take's media.
++
++    Only the *content* counts: the same media frozen into two different takes
++    lands in two different directories, and the two must still be recognized as
++    the same conditioning.
++    """
++    import hashlib
++    digest = hashlib.sha256()
++    for file_digest in sorted(_digest(path) for path in paths):
++        digest.update(file_digest.encode("ascii"))
++        digest.update(b"\0")
++    return digest.hexdigest()
++
++
++def artifact_path(take_dir):
++    """Where a take keeps its encoded conditioning."""
++    return Path(take_dir) / "refs" / FILENAME
++
++
++def save(path, condition_latents, audio_condition_latents, media=""):
++    """Write the encoded conditioning. Returns the record for the session metadata."""
++    from safetensors.torch import save_file
++    conditions = [t.detach().to("cpu").contiguous() for t in condition_latents]
++    audios = [t.detach().to("cpu").contiguous() for t in audio_condition_latents]
++    if not conditions and not audios:
++        return None
++    tensors = {}
++    for index, tensor in enumerate(conditions):
++        tensors["condition_%02d" % index] = tensor
++    for index, tensor in enumerate(audios):
++        tensors["audio_%02d" % index] = tensor
++    meta = {"format": FORMAT, "media": media,
++            "conditions": str(len(conditions)), "audios": str(len(audios))}
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(path.name + ".tmp")
++    save_file(tensors, str(tmp), metadata=meta)
++    os.replace(str(tmp), str(path))
++    return {"path": str(path), "sha256": _digest(str(path)), "media": media,
++            "conditions": len(conditions), "audios": len(audios)}
++
++
++def load(path):
++    """The stored conditioning, or None when there is nothing to reuse."""
++    from safetensors import safe_open
++    path = Path(path or "")
++    if not path.is_file():
++        return None
++    try:
++        with safe_open(str(path), framework="pt") as handle:
++            meta = dict(handle.metadata() or {})
++            keys = list(handle.keys())
++            tensors = {key: handle.get_tensor(key) for key in keys}
++    except Exception:
++        return None
++    if meta.get("format") != FORMAT:
++        return None
++    conditions = [tensors["condition_%02d" % i]
++                  for i in range(int(meta.get("conditions") or 0))
++                  if "condition_%02d" % i in tensors]
++    audios = [tensors["audio_%02d" % i]
++              for i in range(int(meta.get("audios") or 0))
++              if "audio_%02d" % i in tensors]
++    return {"conditions": conditions, "audios": audios, "meta": meta}
++
++
++def set_current(path):
++    """Point the pipeline at the artifact this request may reuse."""
++    _CURRENT["path"] = str(path) if path else None
++    _CURRENT["used"] = None
++    _CURRENT["fallback"] = None
++
++
++def current_state():
++    """What happened with the artifact of the request in flight."""
++    return {"artifact": _CURRENT.get("path"), "reused": _CURRENT.get("used"),
++            "fallback": _CURRENT.get("fallback")}
++
++
++def capture(state, task, take_dir, media=""):
++    """Store the conditioning this take was built on. Returns the record.
++
++    The latents live on the pipeline's shared state, not on the step's own
++    block state: every block builds its own view of the state from its declared
++    inputs, and the encoder's outputs are reached through the state itself.
++    """
++    if task != "ref2va":
++        return None  # A first-frame take's keyframe is its own first frame, not an inherited condition.
++    conditions = list(getattr(state, "condition_latents", None) or [])
++    audios = list(getattr(state, "audio_condition_latents", None) or [])
++    if not conditions and not audios:
++        return None
++    try:
++        return save(artifact_path(take_dir), conditions, audios, media)
++    except Exception:
++        return None  # A missing artifact is a lost optimization, not a failed take.
++
++
++def install_encoder_patch():
++    """Let the pipeline reuse an already encoded conditioning.
++
++    The official `MiniMaxH3Ref2VAReferenceEncoderStep` encodes every reference
++    through the video and audio VAEs. When the request carries an artifact we
++    hand it the stored latents instead, so the reference rows are exactly the
++    ones the parent take was built on.
++
++    The patch is on the class, like the extend hooks: which artifact applies is
++    read from `_CURRENT`, which the worker sets per request. A stored artifact
++    that does not match the request (a different number of references, a
++    different geometry) is *not* used -- the request falls back to encoding the
++    references itself, and says so in the log.
++    """
++    from diffusers.modular_pipelines.minimax_h3.encoders import (
++        MiniMaxH3Ref2VAReferenceEncoderStep)
++    if getattr(MiniMaxH3Ref2VAReferenceEncoderStep, "_solh3_artifact", False):
++        return
++    original = MiniMaxH3Ref2VAReferenceEncoderStep.__call__
++
++    def reference_encoder_with_artifact(self, components, state, _original=original):
++        path = _CURRENT.get("path")
++        if path:
++            stored = load(path)
++            if stored is not None:
++                block_state = self.get_block_state(state)
++                references = list(getattr(block_state, "normalized_references", None) or [])
++                want_conditions = len([r for r in references if r.kind in ("image", "video")])
++                want_audios = len([r for r in references if r.has_audio])
++                if (len(stored["conditions"]) == want_conditions
++                        and len(stored["audios"]) == want_audios):
++                    device = components._execution_device
++                    block_state.condition_latents = [t.to(device) for t in stored["conditions"]]
++                    block_state.audio_condition_latents = list(stored["audios"])
++                    self.set_block_state(state, block_state)
++                    _CURRENT["used"] = str(path)
++                    return components, state
++                _CURRENT["fallback"] = ("stored %d conditions / %d audios, this request has %d / %d"
++                                        % (len(stored["conditions"]), len(stored["audios"]),
++                                           want_conditions, want_audios))
++            else:
++                _CURRENT["fallback"] = "artifact unreadable"
++        return _original(self, components, state)
++
++    MiniMaxH3Ref2VAReferenceEncoderStep.__call__ = reference_encoder_with_artifact
++    MiniMaxH3Ref2VAReferenceEncoderStep._solh3_artifact = True
 diff --git a/sol_h3_engine/extend.py b/sol_h3_engine/extend.py
 new file mode 100644
 index 0000000..3147802
@@ -1213,10 +1455,10 @@ index 0000000..3147802
 +    _self_test()
 +    print("extend.py: all trap tests passed")
 diff --git a/sol_h3_engine/hyperflow_worker.py b/sol_h3_engine/hyperflow_worker.py
-index 6c7b8b7..417f94d 100644
+index 6c7b8b7..f5315ec 100644
 --- a/sol_h3_engine/hyperflow_worker.py
 +++ b/sol_h3_engine/hyperflow_worker.py
-@@ -117,6 +117,250 @@ def pin_unmatched_group(model):
+@@ -117,6 +117,271 @@ def pin_unmatched_group(model):
          sum(p.numel() * p.element_size() for p in group.parameters)
  
  
@@ -1271,6 +1513,10 @@ index 6c7b8b7..417f94d 100644
 +    from . import extend as _extend
 +except ImportError:  # pragma: no cover - worker process
 +    import extend as _extend
++try:
++    from . import condition_artifact as _artifact
++except ImportError:  # pragma: no cover - worker process
++    import condition_artifact as _artifact
 +
 +
 +def install_extend_patches():
@@ -1294,6 +1540,11 @@ index 6c7b8b7..417f94d 100644
 +    from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopSchedulerStep
 +    from hyperflow_h3.blocks import HyperFlowSetTimestepsStep
 +    from hyperflow_h3.schedule import shift_sigmas, endpoints_from_sigmas
++
++    # -- 0. the encoded conditioning artifact -----------------------------------
++    # Lets a take continue on the reference latents its parent was built on,
++    # instead of encoding the references again.
++    _artifact.install_encoder_patch()
 +
 +    # -- 1. prepare_latents: inject the window at cond strength ------------------
 +    original = MiniMaxH3PrepareLatentsStep.__call__
@@ -1453,6 +1704,18 @@ index 6c7b8b7..417f94d 100644
 +            else:
 +                meta.setdefault("pinned_head_frames", 0)
 +                meta.setdefault("delivered_frames", meta["raw_frames"])
++            # The reference latents this take was built on, stored as an artifact
++            # beside the take: the next take in the chain continues on exactly
++            # these, not on a re-encoding of the same media.
++            media = ""
++            try:
++                frozen = json.loads(meta.get("references") or "[]")
++                media = _artifact.media_digest([r.get("path") for r in frozen if r.get("path")])
++            except Exception:
++                media = ""
++            record = _artifact.capture(state, meta.get("task"), Path(target).parent, media)
++            if record:
++                meta["condition_artifact"] = json.dumps(record)
 +            written = _extend.write_session(target, block_state.latents,
 +                                            block_state.audio_latents, meta)
 +            if window is not None:
@@ -1467,7 +1730,7 @@ index 6c7b8b7..417f94d 100644
  class HyperFlow:
      def __init__(self, options, paths):
          overlay = options["hyperflow"]["deps"]
-@@ -187,6 +431,7 @@ class HyperFlow:
+@@ -187,6 +452,7 @@ class HyperFlow:
              dump_qkv(os.environ["SOLH3_DUMP_QKV"])
          if options["hyperflow"].get("fast_vae"):
              self.load_fast_vae(options["hyperflow"]["fast_vae"])
@@ -1475,7 +1738,7 @@ index 6c7b8b7..417f94d 100644
          self.load_s = time.monotonic() - self.started
  
      def install_dit(self, pipe, workflow):
-@@ -282,6 +527,9 @@ class HyperFlow:
+@@ -282,6 +548,9 @@ class HyperFlow:
                  dump = os.environ.get("SOLH3_DUMP_LATENTS")
                  if dump and _name == "MiniMaxH3VideoDecodeStep":  # diagnostics: the exact latents the decoder sees
                      torch.save(self.get_block_state(state).latents.detach().cpu(), dump)
@@ -1485,7 +1748,7 @@ index 6c7b8b7..417f94d 100644
                  if _name == "MiniMaxH3VideoDecodeStep" and _engine.fast_vae is not None:
                      return _engine.fast_video_decode(self, components, state)
                  t0 = time.monotonic()
-@@ -309,6 +557,8 @@ class HyperFlow:
+@@ -309,6 +578,8 @@ class HyperFlow:
                  t0 = time.monotonic()
                  if "vae" in _pinned:
                      _pinned["vae"].to_gpu()
@@ -1494,7 +1757,7 @@ index 6c7b8b7..417f94d 100644
                  try:
                      return _original(self, components, state)
                  finally:
-@@ -316,6 +566,8 @@ class HyperFlow:
+@@ -316,6 +587,8 @@ class HyperFlow:
                      PHASES[_name] = PHASES.get(_name, 0.0) + time.monotonic() - t0
                      if "vae" in _pinned:
                          _pinned["vae"].to_host()
@@ -1503,7 +1766,7 @@ index 6c7b8b7..417f94d 100644
                          torch.cuda.empty_cache()
              cls.__call__ = encode_staged
              cls._solh3_staged = True
-@@ -384,8 +636,12 @@ class HyperFlow:
+@@ -384,8 +657,12 @@ class HyperFlow:
          kwargs.setdefault("height", 768)
          kwargs.setdefault("width", 1344)
          if task == "ref2va":
@@ -1518,7 +1781,7 @@ index 6c7b8b7..417f94d 100644
          kwargs.update(num_frames=124, output_type="pt", generator=torch.Generator().manual_seed(case["seed"]))
          PHASES.clear()
          if swap_s > 0.5:
-@@ -406,6 +662,14 @@ class HyperFlow:
+@@ -406,6 +683,14 @@ class HyperFlow:
                  part.to_host()
              torch.cuda.empty_cache()
              PHASES["decoders.to_cpu"] = time.monotonic() - t0
@@ -1533,7 +1796,7 @@ index 6c7b8b7..417f94d 100644
          if steps[0] != 8:
              raise RuntimeError("HyperFlow must run exactly 8 DiT forwards, got %d" % steps[0])
          progress("saving", 8, 8)
-@@ -416,7 +680,29 @@ class HyperFlow:
+@@ -416,7 +701,29 @@ class HyperFlow:
          t0 = time.monotonic()
          write_mp4(output, video[:OUTPUT_FRAMES], audio, result["sampling_rate"])
          PHASES["write_mp4"] = time.monotonic() - t0
@@ -1564,7 +1827,7 @@ index 6c7b8b7..417f94d 100644
                  "phases_s": {k: round(v, 2) for k, v in PHASES.items()}}
  
  
-@@ -451,6 +737,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+@@ -451,6 +758,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
      sys.path.insert(0, str(RUNTIME))
      from runtime.qwen_ops.media import load_rgb, prepare_keyframe_image
      mode, images = request.get("mode", "text"), list(request.get("images") or [])
@@ -1572,7 +1835,7 @@ index 6c7b8b7..417f94d 100644
      # 16:9 canvases, both axes multiples of 32 (the VAE's 16 x the 2x2 patch).
      height, width = CANVAS[request.get("resolution", "768p")]
      qcase = dict(case)
-@@ -463,6 +750,8 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+@@ -463,6 +771,8 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
          qcase.update(task="fl2va", first_frame=images[0], keyframe_canvas=(height, width))
          keyframes = [prepare_keyframe_image(load_rgb(images[0]), height, width, stretch=True)]
      elif mode == "reference":
@@ -1581,7 +1844,7 @@ index 6c7b8b7..417f94d 100644
          if not 1 <= len(images) <= 9:
              raise ValueError("Reference mode needs 1 to 9 images")
          # Qwen sees each reference at the canvas's pixel budget (Sol-H3 Spark ref2va "match"), not at a 2048 short
-@@ -493,6 +782,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
+@@ -493,6 +803,7 @@ def local_conditioning(case, request, request_dir, paths, config, Worker, qwen=N
          out.update(keyframes=keyframes, keyframe_anchors=("first",))
      if mode == "reference":
          out["reference_images"] = images
@@ -1589,7 +1852,7 @@ index 6c7b8b7..417f94d 100644
      return out, receipt["request_wall_s"]
  
  
-@@ -527,6 +817,9 @@ def serve(options, write_json):
+@@ -527,6 +838,9 @@ def serve(options, write_json):
              if request["op"] != "generate":
                  raise ValueError("Unsupported operation")
              progress_path = request.get("progress")
@@ -1599,7 +1862,7 @@ index 6c7b8b7..417f94d 100644
  
              def progress(stage, step=None, steps=None):
                  if progress_path:
-@@ -565,15 +858,84 @@ def serve(options, write_json):
+@@ -565,15 +879,86 @@ def serve(options, write_json):
                      write_json(request["response"], {"status": "PASS", "payload": str(request_dir / "payload.pt"),
                                                       "qwen_s": qwen_s, "task": case["task"]})
                      continue
@@ -1654,6 +1917,7 @@ index 6c7b8b7..417f94d 100644
 +                    # is the one the ref2va variants already carry. A text extend stays t2va.
 +                    if mode != "reference":
 +                        case["task"] = "t2va"
++                _artifact.set_current(request.get("condition_artifact"))
                  row = engine.generate(case, payload, request_dir, progress)
                  e2e = (time.monotonic_ns() - started) / 1e9
                  progress("done", 8, 8)
@@ -1681,11 +1945,12 @@ index 6c7b8b7..417f94d 100644
 +                    "session": (_EXTEND.get("session_target") if window is None
 +                                else window.get("session_written")),
 +                    "extend": extend_report,
++                    "condition_artifact": _artifact.current_state(),
 +                    "profile": options["name"], "precision": "hyperflow",
                      "decoder": "original", "single_stage": True, "cold_start": cold,
                      "startup_and_warmup_s": engine.load_s if cold else 0, "prompt": case["prompt"],
                      "timing": "request through completed MP4; model load reported separately"})
-@@ -581,6 +943,11 @@ def serve(options, write_json):
+@@ -581,6 +966,12 @@ def serve(options, write_json):
                  write_json(request["response"], {"status": "FAIL",
                                                   "error": "%s: %s" % (type(error).__name__, error)})
                  raise
@@ -1694,6 +1959,7 @@ index 6c7b8b7..417f94d 100644
 +                _EXTEND["session_target"] = None
 +                _EXTEND["session_meta"] = None
 +                _EXTEND["adaln_key"] = None
++                _artifact.set_current(None)
      finally:
          signal.signal(signal.SIGTERM, signal.SIG_IGN)
          signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -1711,22 +1977,368 @@ index a4621b3..db7b43e 100644
  from custom_sol_h3.sol_h3_engine import config, bridge
  assert config.config_path() == root / "config.json"
 diff --git a/tests/test_studio.py b/tests/test_studio.py
-index 44b8424..f1ecfa2 100644
+index 44b8424..cb197d6 100644
 --- a/tests/test_studio.py
 +++ b/tests/test_studio.py
-@@ -11,7 +11,7 @@ import unittest
- from unittest.mock import patch
- 
- from test_bridge import FAKE, ROOT, bridge
+@@ -1,179 +1,436 @@
+-"""CPU tests for the Studio backend contract: capabilities, request forwarding, progress, library."""
+-import json
+-import os
+-from pathlib import Path
+-import shutil
+-import subprocess
+-import sys
+-import tempfile
+-import time
+-import unittest
+-from unittest.mock import patch
+-
+-from test_bridge import FAKE, ROOT, bridge
 -from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config
-+from sol_engine_test.sol_h3_engine import comfy_nodes, comfy_routes, config, extend as engine_extend
- 
- # Records each request the fake pipeline sees, and writes a worker progress file.
- RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
-@@ -175,5 +175,186 @@ class StudioGallery(unittest.TestCase):
-             self.assertEqual(comfy_routes.list_gallery(None), {"items": []})
- 
- 
+-
+-# Records each request the fake pipeline sees, and writes a worker progress file.
+-RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
+-  if case["prompt"]=="SLOW":
+-   Path(REQUEST["progress"]).write_text(json.dumps({"stage":"denoising","step":2,"steps":4}))
+-   time.sleep(1.5)
+-  output=self.root/(case["case_id"]+".mp4")''')
+-
+-
+-class StudioConfig(unittest.TestCase):
+-    def setUp(self):
+-        self.temp = tempfile.TemporaryDirectory()
+-        path = Path(self.temp.name) / "config.json"
+-        path.write_text(json.dumps({"profiles": {
+-            "FP8": {"precision": "fp8", "label": "Fast", "python": "x", "paths": "y"},
+-            "Image": {"precision": "bf16", "steps": 8, "modes": ["text", "first_frame"],
+-                      "resolutions": ["768p", "480p"], "latency_s": 67.2},
+-            "Two": {"precision": "two_stage"}}}))
+-        self.env = patch.dict(os.environ, {"SOL_ENGINE_CONFIG": str(path)})
+-        self.env.start()
+-
+-    def tearDown(self):
+-        self.env.stop()
+-        self.temp.cleanup()
+-
+-    def test_capabilities(self):
+-        value = json.loads(json.dumps(config.capabilities()))
+-        self.assertEqual(value["profiles"], [
+-            {"name": "FP8", "label": "Fast", "steps": 4, "pipeline": "one_stage", "modes": ["text"],
+-             "resolutions": ["768p"], "latency_s": None, "default": True},
+-            {"name": "Image", "label": "Image", "steps": 8, "pipeline": "one_stage",
+-             "modes": ["text", "first_frame"], "resolutions": ["768p", "480p"], "latency_s": 67.2, "default": False},
+-            {"name": "Two", "label": "Two", "steps": 7, "pipeline": "two_stage", "modes": ["text"],
+-             "resolutions": ["768p"], "latency_s": None, "default": False}])
+-        self.assertEqual(value["device"], {"id": "rtx5090", "label": "RTX 5090"})
+-
+-    def test_node_rejects_unsupported_requests(self):
+-        node = comfy_nodes.SolH3Generate()
+-        with self.assertRaisesRegex(ValueError, "does not support first-frame mode"):
+-            node.generate("FP8", "a scene", 1, mode="first_frame", image="a.png")
+-        with self.assertRaisesRegex(ValueError, "does not support reference-image mode"):
+-            node.generate("Image", "a scene", 1, mode="reference", image="a.png")
+-        with self.assertRaisesRegex(ValueError, "Unknown backend"):
+-            node.generate("FP8", "a scene", 1, backend="remote")
+-        with self.assertRaisesRegex(ValueError, "renders 768p only"):
+-            node.generate("FP8", "a scene", 1, resolution="480p")
+-        with self.assertRaisesRegex(ValueError, "Upload an image"):
+-            node.generate("Image", "a scene", 1, mode="first_frame", image="")
+-        with self.assertRaisesRegex(ValueError, "exactly one image"):
+-            node.generate("Image", "a scene", 1, mode="first_frame", image="a.png,b.png")
+-        optional = comfy_nodes.SolH3Generate.INPUT_TYPES()["optional"]
+-        self.assertEqual([optional[k][1]["default"] for k in ("mode", "image", "backend", "resolution")],
+-                         ["text", "", "local", "768p"])
+-
+-
+-class StudioBridge(unittest.TestCase):
+-    def setUp(self):
+-        self.temp = tempfile.TemporaryDirectory()
+-        self.root = Path(self.temp.name)
+-        shutil.copy2(ROOT / "sol_h3_engine/worker.py", self.root / "worker.py")
+-        # The fake pipeline reads the raw request through a module global set by worker.py's loop.
+-        worker = (self.root / "worker.py").read_text().replace(
+-            '            request = json.loads(line)\n',
+-            '            request = json.loads(line)\n            sys.modules["runtime.pipeline"].REQUEST = request\n')
+-        (self.root / "worker.py").write_text(worker)
+-        runtime = self.root / "runtimes/h3_fp8/runtime"
+-        runtime.mkdir(parents=True)
+-        (runtime / "__init__.py").touch()
+-        (runtime / "pipeline.py").write_text(RECORD)
+-        (runtime / "config.py").write_text('def load_paths(p): return {}\ndef load_recipe(): return {"stage1":{"width":1344}}\ndef normalize_case(c): return c\n')
+-        self.old_root = bridge.ROOT
+-        bridge.ROOT = self.root
+-        self.profile = dict(python=sys.executable, precision="fp8", gpu="0", paths="unused", name="fake")
+-
+-    def tearDown(self):
+-        bridge.close()
+-        bridge.ROOT = self.old_root
+-        self.temp.cleanup()
+-
+-    def test_forwards_mode_and_images(self):
+-        image = str(self.root / "frame.png")
+-        bridge.generate(self.profile, self.root, "scene", 7, mode="first_frame", images=[image])
+-        request = json.loads(next((self.root / "sol_h3").glob("*/request.json")).read_text())
+-        self.assertEqual((request["mode"], request["images"], request["resolution"]), ("first_frame", [image], "768p"))
+-        bridge.generate(self.profile, self.root, "scene", 8, resolution="480p")
+-        request = json.loads(next((self.root / "sol_h3").glob("*/request.json")).read_text())
+-        self.assertEqual((request["mode"], request["images"], request["resolution"]), ("text", [], "480p"))
+-
+-    def test_progress_callback(self):
+-        updates = []
+-        bridge.generate(self.profile, self.root, "SLOW", 7, progress=updates.append)
+-        self.assertTrue(updates)
+-        self.assertTrue(all(isinstance(u["elapsed_s"], float) for u in updates))
+-        # Before the worker writes its file the stage is generic ("generating"); afterwards it is the worker's.
+-        # The first poll can land on either side of that write, so only the stage set is checked.
+-        self.assertLessEqual({u["stage"] for u in updates}, {"generating", "denoising"})
+-        self.assertIn({"stage": "denoising", "step": 2, "steps": 4},
+-                      [{k: u.get(k) for k in ("stage", "step", "steps")} for u in updates])
+-
+-
+-class StudioLibrary(unittest.TestCase):
+-    def test_listing_merges_sidecars(self):
+-        with tempfile.TemporaryDirectory() as temp:
+-            root = Path(temp)
+-            (root / "SolH3").mkdir()
+-            now = time.time()
+-            for index, name in enumerate(("studio_00001_.mp4", "studio_00002_.mp4", "other.mp4")):
+-                path = root / "SolH3" / name
+-                path.write_bytes(b"mp4")
+-                os.utime(path, (now + index * 60, now + index * 60))
+-            (root / "unrelated.mp4").write_bytes(b"outside library")
+-            comfy_nodes.write_sidecar(root, "p1", {"output": "/engine/a.mp4", "prompt": "first",
+-                                                   "profile": "FP8", "e2e_s": 12.5}, "text", 1)
+-            record = root / "SolH3/library/p1.json"
+-            data = json.loads(record.read_text()) | {"created": now - 1}
+-            record.write_text(json.dumps(data))
+-            (root / "SolH3/library/p2.json").write_text(json.dumps(
+-                {"id": "p2", "prompt": "second", "mode": "text", "seed": 2, "created": now + 59}))
+-            items = comfy_routes.list_videos(root, limit=8)["items"]
+-            self.assertEqual([i["file"] for i in items],
+-                             ["other.mp4", "studio_00002_.mp4", "studio_00001_.mp4"])
+-            self.assertEqual([i["prompt"] for i in items], [None, "second", "first"])
+-            self.assertEqual((items[2]["subfolder"], items[2]["type"], items[2]["e2e_s"]),
+-                             ("SolH3", "output", 12.5))
+-            self.assertEqual(len(comfy_routes.list_videos(root, limit=1)["items"]), 1)
+-            with self.assertRaises(ValueError):
+-                comfy_routes.video_path(root, "../unrelated.mp4")
+-
+-
+-class WebSyntax(unittest.TestCase):
+-    def test_web_modules_parse(self):
+-        node = shutil.which("node")
+-        if node is None:
+-            self.skipTest("node is not installed")
+-        for path in sorted((ROOT / "web").glob("*.js")):
+-            with self.subTest(path=path.name):
+-                # --check needs module syntax: import/export would fail as a script.
+-                subprocess.run([node, "--input-type=module", "--check"], input=path.read_text(),
+-                               text=True, check=True, timeout=30, capture_output=True)
+-
+-
+-class StudioGallery(unittest.TestCase):
+-    def test_listing_and_files(self):
+-        with tempfile.TemporaryDirectory() as temp:
+-            root = Path(temp)
+-            (root / "b-koi.mp4").write_bytes(b"mp4")
+-            (root / "b-koi.json").write_text(json.dumps({"prompt": "koi", "image": "b-koi.png", "order": 2}))
+-            (root / "b-koi.png").write_bytes(b"png")
+-            (root / "a-eagle.mp4").write_bytes(b"mp4")
+-            (root / "a-eagle.json").write_text(json.dumps({"prompt": "eagle", "title": "Eagle", "order": 1}))
+-            (root / "c-orphan.mp4").write_bytes(b"no sidecar")
+-            (root / "d-bad.mp4").write_bytes(b"mp4")
+-            (root / "d-bad.json").write_text(json.dumps({"title": "no prompt"}))
+-            items = comfy_routes.list_gallery(root)["items"]
+-            self.assertEqual([(i["name"], i["mode"], i["image"], i["title"]) for i in items],
+-                             [("a-eagle", "text", None, "Eagle"), ("b-koi", "first_frame", "b-koi.png", "b koi")])
+-            self.assertEqual(comfy_routes.gallery_file(root, "b-koi.png")[1], "image/png")
+-            for bad in ("../x.mp4", "b-koi.json", ".hidden.mp4", "", "missing.mp4"):
+-                with self.assertRaises(ValueError):
+-                    comfy_routes.gallery_file(root, bad)
+-            self.assertEqual(comfy_routes.list_gallery(None), {"items": []})
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
++"""CPU tests for the Studio backend contract: capabilities, request forwarding, progress, library."""
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++from unittest.mock import patch
++
++from test_bridge import FAKE, ROOT, bridge
++from sol_engine_test.sol_h3_engine import (comfy_nodes, comfy_routes, config,
++                                         extend as engine_extend,
++                                         condition_artifact as engine_artifact)
++
++# Records each request the fake pipeline sees, and writes a worker progress file.
++RECORD = FAKE.replace('''  output=self.root/(case["case_id"]+".mp4")''', '''  (self.root.parent/"request.json").write_text(json.dumps(REQUEST))
++  if case["prompt"]=="SLOW":
++   Path(REQUEST["progress"]).write_text(json.dumps({"stage":"denoising","step":2,"steps":4}))
++   time.sleep(1.5)
++  output=self.root/(case["case_id"]+".mp4")''')
++
++
++class StudioConfig(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        path = Path(self.temp.name) / "config.json"
++        path.write_text(json.dumps({"profiles": {
++            "FP8": {"precision": "fp8", "label": "Fast", "python": "x", "paths": "y"},
++            "Image": {"precision": "bf16", "steps": 8, "modes": ["text", "first_frame"],
++                      "resolutions": ["768p", "480p"], "latency_s": 67.2},
++            "Two": {"precision": "two_stage"}}}))
++        self.env = patch.dict(os.environ, {"SOL_ENGINE_CONFIG": str(path)})
++        self.env.start()
++
++    def tearDown(self):
++        self.env.stop()
++        self.temp.cleanup()
++
++    def test_capabilities(self):
++        value = json.loads(json.dumps(config.capabilities()))
++        self.assertEqual(value["profiles"], [
++            {"name": "FP8", "label": "Fast", "steps": 4, "pipeline": "one_stage", "modes": ["text"],
++             "resolutions": ["768p"], "latency_s": None, "default": True},
++            {"name": "Image", "label": "Image", "steps": 8, "pipeline": "one_stage",
++             "modes": ["text", "first_frame"], "resolutions": ["768p", "480p"], "latency_s": 67.2, "default": False},
++            {"name": "Two", "label": "Two", "steps": 7, "pipeline": "two_stage", "modes": ["text"],
++             "resolutions": ["768p"], "latency_s": None, "default": False}])
++        self.assertEqual(value["device"], {"id": "rtx5090", "label": "RTX 5090"})
++
++    def test_node_rejects_unsupported_requests(self):
++        node = comfy_nodes.SolH3Generate()
++        with self.assertRaisesRegex(ValueError, "does not support first-frame mode"):
++            node.generate("FP8", "a scene", 1, mode="first_frame", image="a.png")
++        with self.assertRaisesRegex(ValueError, "does not support reference-image mode"):
++            node.generate("Image", "a scene", 1, mode="reference", image="a.png")
++        with self.assertRaisesRegex(ValueError, "Unknown backend"):
++            node.generate("FP8", "a scene", 1, backend="remote")
++        with self.assertRaisesRegex(ValueError, "renders 768p only"):
++            node.generate("FP8", "a scene", 1, resolution="480p")
++        with self.assertRaisesRegex(ValueError, "Upload an image"):
++            node.generate("Image", "a scene", 1, mode="first_frame", image="")
++        with self.assertRaisesRegex(ValueError, "exactly one image"):
++            node.generate("Image", "a scene", 1, mode="first_frame", image="a.png,b.png")
++        optional = comfy_nodes.SolH3Generate.INPUT_TYPES()["optional"]
++        self.assertEqual([optional[k][1]["default"] for k in ("mode", "image", "backend", "resolution")],
++                         ["text", "", "local", "768p"])
++
++
++class StudioBridge(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.root = Path(self.temp.name)
++        shutil.copy2(ROOT / "sol_h3_engine/worker.py", self.root / "worker.py")
++        # The fake pipeline reads the raw request through a module global set by worker.py's loop.
++        worker = (self.root / "worker.py").read_text().replace(
++            '            request = json.loads(line)\n',
++            '            request = json.loads(line)\n            sys.modules["runtime.pipeline"].REQUEST = request\n')
++        (self.root / "worker.py").write_text(worker)
++        runtime = self.root / "runtimes/h3_fp8/runtime"
++        runtime.mkdir(parents=True)
++        (runtime / "__init__.py").touch()
++        (runtime / "pipeline.py").write_text(RECORD)
++        (runtime / "config.py").write_text('def load_paths(p): return {}\ndef load_recipe(): return {"stage1":{"width":1344}}\ndef normalize_case(c): return c\n')
++        self.old_root = bridge.ROOT
++        bridge.ROOT = self.root
++        self.profile = dict(python=sys.executable, precision="fp8", gpu="0", paths="unused", name="fake")
++
++    def tearDown(self):
++        bridge.close()
++        bridge.ROOT = self.old_root
++        self.temp.cleanup()
++
++    def test_forwards_mode_and_images(self):
++        image = str(self.root / "frame.png")
++        bridge.generate(self.profile, self.root, "scene", 7, mode="first_frame", images=[image])
++        request = json.loads(next((self.root / "sol_h3").glob("*/request.json")).read_text())
++        self.assertEqual((request["mode"], request["images"], request["resolution"]), ("first_frame", [image], "768p"))
++        bridge.generate(self.profile, self.root, "scene", 8, resolution="480p")
++        request = json.loads(next((self.root / "sol_h3").glob("*/request.json")).read_text())
++        self.assertEqual((request["mode"], request["images"], request["resolution"]), ("text", [], "480p"))
++
++    def test_progress_callback(self):
++        updates = []
++        bridge.generate(self.profile, self.root, "SLOW", 7, progress=updates.append)
++        self.assertTrue(updates)
++        self.assertTrue(all(isinstance(u["elapsed_s"], float) for u in updates))
++        # Before the worker writes its file the stage is generic ("generating"); afterwards it is the worker's.
++        # The first poll can land on either side of that write, so only the stage set is checked.
++        self.assertLessEqual({u["stage"] for u in updates}, {"generating", "denoising"})
++        self.assertIn({"stage": "denoising", "step": 2, "steps": 4},
++                      [{k: u.get(k) for k in ("stage", "step", "steps")} for u in updates])
++
++
++class StudioLibrary(unittest.TestCase):
++    def test_listing_merges_sidecars(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            (root / "SolH3").mkdir()
++            now = time.time()
++            for index, name in enumerate(("studio_00001_.mp4", "studio_00002_.mp4", "other.mp4")):
++                path = root / "SolH3" / name
++                path.write_bytes(b"mp4")
++                os.utime(path, (now + index * 60, now + index * 60))
++            (root / "unrelated.mp4").write_bytes(b"outside library")
++            comfy_nodes.write_sidecar(root, "p1", {"output": "/engine/a.mp4", "prompt": "first",
++                                                   "profile": "FP8", "e2e_s": 12.5}, "text", 1)
++            record = root / "SolH3/library/p1.json"
++            data = json.loads(record.read_text()) | {"created": now - 1}
++            record.write_text(json.dumps(data))
++            (root / "SolH3/library/p2.json").write_text(json.dumps(
++                {"id": "p2", "prompt": "second", "mode": "text", "seed": 2, "created": now + 59}))
++            items = comfy_routes.list_videos(root, limit=8)["items"]
++            self.assertEqual([i["file"] for i in items],
++                             ["other.mp4", "studio_00002_.mp4", "studio_00001_.mp4"])
++            self.assertEqual([i["prompt"] for i in items], [None, "second", "first"])
++            self.assertEqual((items[2]["subfolder"], items[2]["type"], items[2]["e2e_s"]),
++                             ("SolH3", "output", 12.5))
++            self.assertEqual(len(comfy_routes.list_videos(root, limit=1)["items"]), 1)
++            with self.assertRaises(ValueError):
++                comfy_routes.video_path(root, "../unrelated.mp4")
++
++
++class WebSyntax(unittest.TestCase):
++    def test_web_modules_parse(self):
++        node = shutil.which("node")
++        if node is None:
++            self.skipTest("node is not installed")
++        for path in sorted((ROOT / "web").glob("*.js")):
++            with self.subTest(path=path.name):
++                # --check needs module syntax: import/export would fail as a script.
++                subprocess.run([node, "--input-type=module", "--check"], input=path.read_text(),
++                               text=True, check=True, timeout=30, capture_output=True)
++
++
++class StudioGallery(unittest.TestCase):
++    def test_listing_and_files(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            (root / "b-koi.mp4").write_bytes(b"mp4")
++            (root / "b-koi.json").write_text(json.dumps({"prompt": "koi", "image": "b-koi.png", "order": 2}))
++            (root / "b-koi.png").write_bytes(b"png")
++            (root / "a-eagle.mp4").write_bytes(b"mp4")
++            (root / "a-eagle.json").write_text(json.dumps({"prompt": "eagle", "title": "Eagle", "order": 1}))
++            (root / "c-orphan.mp4").write_bytes(b"no sidecar")
++            (root / "d-bad.mp4").write_bytes(b"mp4")
++            (root / "d-bad.json").write_text(json.dumps({"title": "no prompt"}))
++            items = comfy_routes.list_gallery(root)["items"]
++            self.assertEqual([(i["name"], i["mode"], i["image"], i["title"]) for i in items],
++                             [("a-eagle", "text", None, "Eagle"), ("b-koi", "first_frame", "b-koi.png", "b koi")])
++            self.assertEqual(comfy_routes.gallery_file(root, "b-koi.png")[1], "image/png")
++            for bad in ("../x.mp4", "b-koi.json", ".hidden.mp4", "", "missing.mp4"):
++                with self.assertRaises(ValueError):
++                    comfy_routes.gallery_file(root, bad)
++            self.assertEqual(comfy_routes.list_gallery(None), {"items": []})
++
++
 +class StudioReferences(unittest.TestCase):
 +    """Native IMAGE / AUDIO sockets: a wired reference becomes a file the engine can read."""
 +
@@ -1903,13 +2515,87 @@ index 44b8424..f1ecfa2 100644
 +            comfy_nodes.inherited_references(str(session))
 +
 +
-+def torch_zeros():
++def torch_zeros(shape=(1, 24, 1, 4, 4)):
 +    import torch
-+    return torch.zeros((1, 24, 1, 4, 4))
++    return torch.zeros(shape)
 +
 +
- if __name__ == "__main__":
-     unittest.main()
++
++class ConditionArtifact(unittest.TestCase):
++    """The encoded conditioning, stored and loaded as an artifact."""
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.root = Path(self.temp.name)
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def test_save_and_load_round_trip(self):
++        import torch
++        conditions = [torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2),
++                      torch.ones(1, 3, 1, 4, 4)]
++        audios = [torch.zeros(8, 32)]
++        path = self.root / "refs" / "conditioning.safetensors"
++        record = engine_artifact.save(path, conditions, audios, media="abc")
++        self.assertTrue(path.is_file())
++        self.assertEqual(record["conditions"], 2)
++        self.assertEqual(record["audios"], 1)
++        self.assertEqual(record["media"], "abc")
++        loaded = engine_artifact.load(path)
++        self.assertEqual(len(loaded["conditions"]), 2)
++        self.assertEqual(len(loaded["audios"]), 1)
++        for original, restored in zip(conditions, loaded["conditions"]):
++            self.assertTrue(torch.equal(original, restored))
++
++    def test_load_refuses_a_foreign_file(self):
++        from safetensors.torch import save_file
++        path = self.root / "foreign.safetensors"
++        save_file({"x": torch_zeros()}, str(path), metadata={"format": "something-else"})
++        self.assertIsNone(engine_artifact.load(path))
++        self.assertIsNone(engine_artifact.load(self.root / "missing.safetensors"))
++
++    def test_media_digest_follows_the_content_not_the_path(self):
++        first = self.root / "a" / "ref.png"
++        second = self.root / "b" / "ref.png"
++        first.parent.mkdir(parents=True)
++        second.parent.mkdir(parents=True)
++        first.write_bytes(b"same pixels")
++        second.write_bytes(b"same pixels")
++        other = self.root / "c.png"
++        other.write_bytes(b"other pixels")
++        self.assertEqual(engine_artifact.media_digest([str(first)]),
++                         engine_artifact.media_digest([str(second)]))
++        self.assertNotEqual(engine_artifact.media_digest([str(first)]),
++                            engine_artifact.media_digest([str(other)]))
++
++    def test_a_take_reads_the_artifact_of_its_parent(self):
++        from safetensors.torch import save_file
++        artifact = self.root / "conditioning.safetensors"
++        engine_artifact.save(artifact, [torch_zeros()], [], media="m")
++        record = {"path": str(artifact), "sha256": "x", "media": "m",
++                  "conditions": 1, "audios": 0}
++        session = self.root / "session.session.safetensors"
++        save_file({"video": torch_zeros((1, 24, 1, 4, 4)), "audio": torch_zeros((2, 32, 1))},
++                  str(session),
++                  metadata={"format": "solx-v1",
++                            "references": json.dumps([]),
++                            "condition_artifact": json.dumps(record)})
++        found = comfy_nodes.inherited_artifact(str(session))
++        self.assertIsNotNone(found)
++        self.assertEqual(found["path"], str(artifact))
++        # A take without an artifact simply has none.
++        plain = self.root / "plain.session.safetensors"
++        save_file({"video": torch_zeros((1, 24, 1, 4, 4)), "audio": torch_zeros((2, 32, 1))},
++                  str(plain), metadata={"format": "solx-v1"})
++        self.assertIsNone(comfy_nodes.inherited_artifact(str(plain)))
++        # An artifact whose file is gone is not handed on.
++        Path(record["path"]).unlink()
++        self.assertIsNone(comfy_nodes.inherited_artifact(str(session)))
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/web/studio.css b/web/studio.css
 index b51353e..912dedd 100644
 --- a/web/studio.css

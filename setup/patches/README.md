@@ -31,6 +31,7 @@ bash setup/apply-engine-patches.sh --revert   # 反向还原回上游版本
 |---|---|
 | `sol_h3_engine/hyperflow_worker.py` | 续接的尾窗钉住、ref2va 续接、音频行偏移修正、条件冻结 |
 | `sol_h3_engine/extend.py` | **新增文件**：masked 续接的帧/潜空间算术与 session sidecar |
+| `sol_h3_engine/condition_artifact.py` | **新增文件**：条件冻结成产物——参考素材的字节副本 + 已编码的参考潜变量（obvpm 的 `minimax_refs` 等价物），续接时直接复用 |
 | `sol_h3_engine/comfy_nodes.py` | `output_dir`/`filename` 保存控制、IMAGE/AUDIO 原生插槽、参考继承与指纹校验 |
 | `sol_h3_engine/comfy_routes.py` | 作品库按 take 收录、新增 `GET /solh3/sessions` |
 | `sol_h3_engine/bridge.py` | 常驻引擎进程管理 |

@@ -72,7 +72,8 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 The engine itself is upstream [NVlabs/Sana](https://github.com/NVlabs/Sana)'s
 `models/minimax_h3/Sol-H3-ComfyUI`. Everything we added to it (Extend continuation,
 native reference image/audio sockets, `output_dir`/`filename`, conditions frozen as
-artifacts, take-based library, Studio's "continue from" picker) ships as a **patch**
+artifactsconditions frozen as
+artifacts -- both the media bytes and the already encoded reference latents --, take-based library, Studio's "continue from" picker) ships as a **patch**
 under `setup/patches/`, applied by `setup/apply-engine-patches.sh`:
 
 ```bash

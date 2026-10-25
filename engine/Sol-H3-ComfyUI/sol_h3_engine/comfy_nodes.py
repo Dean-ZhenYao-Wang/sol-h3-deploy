@@ -8,6 +8,7 @@ import uuid
 
 from . import bridge
 from . import extend as _extend
+from . import condition_artifact as _artifact
 from .config import RESOLUTIONS, DEFAULT_STEPS, load_profile, profile_resolutions, profile_modes, profile_names
 
 MODES = ["text", "first_frame", "reference", "extend"]
@@ -219,6 +220,36 @@ def inherited_references(session_path):
                 % (path, digest[:12], expected[:12]))
         (images if kind == "image" else audios).append(path)
     return images, audios
+
+
+def inherited_artifact(session_path):
+    """The parent's encoded conditioning artifact, if it stored one.
+
+    obvpm's `condload` in one piece: the artifact *is* the conditioning, so a
+    take that continues the chain can reuse the very latents the parent was
+    built on. The artifact belongs to the media it was made from, so it is only
+    handed on when the media is inherited unchanged.
+    """
+    from safetensors import safe_open
+    path = Path(session_path or "")
+    if not path.is_file():
+        return None
+    try:
+        with safe_open(str(path), framework="pt") as handle:
+            raw = (handle.metadata() or {}).get("condition_artifact")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or not record.get("path"):
+        return None
+    if not os.path.isfile(record["path"]):
+        return None
+    return record
 
 
 def check_request(profile, mode, backend, resolution="768p"):
@@ -518,10 +549,18 @@ class SolH3Extend:
         # images and audio, while the pinned window keeps the seam continuous.
         images, audios = collect_references("reference", image, audio, image_input,
                                             (audio_1, audio_2, audio_3))
+        artifact = None
         if not images and not audios:
             # obvpm's model: the chain inherits the conditioning of the take it
             # continues. Attach references to replace it.
             images, audios = inherited_references(session)
+            artifact = inherited_artifact(session)
+            if artifact:
+                # The artifact is the parent's encoding of *its* media; it only
+                # applies while the media is the same one.
+                media = _artifact.media_digest(images + audios)
+                if media != artifact.get("media"):
+                    artifact = None
         mode = "reference" if images else "text"
         check_request(profile, mode, "local", resolution)
         from comfy_api.latest import InputImpl
@@ -548,6 +587,7 @@ class SolH3Extend:
                                          cancel=mm.throw_exception_if_processing_interrupted,
                                          mode=mode, images=images, audios=audios,
                                          progress=progress, resolution=resolution,
+                                         condition_artifact=(artifact or {}).get("path"),
                                          extend={"session": session.strip(),
                                                  "window_frames": int(window_frames)})
             finally:

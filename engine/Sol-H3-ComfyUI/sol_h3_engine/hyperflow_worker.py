@@ -168,6 +168,10 @@ try:  # package import under ComfyUI, flat import in the worker process
     from . import extend as _extend
 except ImportError:  # pragma: no cover - worker process
     import extend as _extend
+try:
+    from . import condition_artifact as _artifact
+except ImportError:  # pragma: no cover - worker process
+    import condition_artifact as _artifact
 
 
 def install_extend_patches():
@@ -191,6 +195,11 @@ def install_extend_patches():
     from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopSchedulerStep
     from hyperflow_h3.blocks import HyperFlowSetTimestepsStep
     from hyperflow_h3.schedule import shift_sigmas, endpoints_from_sigmas
+
+    # -- 0. the encoded conditioning artifact -----------------------------------
+    # Lets a take continue on the reference latents its parent was built on,
+    # instead of encoding the references again.
+    _artifact.install_encoder_patch()
 
     # -- 1. prepare_latents: inject the window at cond strength ------------------
     original = MiniMaxH3PrepareLatentsStep.__call__
@@ -350,6 +359,18 @@ def install_extend_patches():
             else:
                 meta.setdefault("pinned_head_frames", 0)
                 meta.setdefault("delivered_frames", meta["raw_frames"])
+            # The reference latents this take was built on, stored as an artifact
+            # beside the take: the next take in the chain continues on exactly
+            # these, not on a re-encoding of the same media.
+            media = ""
+            try:
+                frozen = json.loads(meta.get("references") or "[]")
+                media = _artifact.media_digest([r.get("path") for r in frozen if r.get("path")])
+            except Exception:
+                media = ""
+            record = _artifact.capture(state, meta.get("task"), Path(target).parent, media)
+            if record:
+                meta["condition_artifact"] = json.dumps(record)
             written = _extend.write_session(target, block_state.latents,
                                             block_state.audio_latents, meta)
             if window is not None:
@@ -909,6 +930,7 @@ def serve(options, write_json):
                     # is the one the ref2va variants already carry. A text extend stays t2va.
                     if mode != "reference":
                         case["task"] = "t2va"
+                _artifact.set_current(request.get("condition_artifact"))
                 row = engine.generate(case, payload, request_dir, progress)
                 e2e = (time.monotonic_ns() - started) / 1e9
                 progress("done", 8, 8)
@@ -935,6 +957,7 @@ def serve(options, write_json):
                     "session": (_EXTEND.get("session_target") if window is None
                                 else window.get("session_written")),
                     "extend": extend_report,
+                    "condition_artifact": _artifact.current_state(),
                     "profile": options["name"], "precision": "hyperflow",
                     "decoder": "original", "single_stage": True, "cold_start": cold,
                     "startup_and_warmup_s": engine.load_s if cold else 0, "prompt": case["prompt"],
@@ -948,6 +971,7 @@ def serve(options, write_json):
                 _EXTEND["session_target"] = None
                 _EXTEND["session_meta"] = None
                 _EXTEND["adaln_key"] = None
+                _artifact.set_current(None)
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)

@@ -130,6 +130,7 @@ marker() {
   fi
 }
 marker sol_h3_engine/extend.py "def freeze_references"
+marker sol_h3_engine/condition_artifact.py "def install_encoder_patch"
 marker sol_h3_engine/hyperflow_worker.py "freeze_references"
 marker sol_h3_engine/comfy_nodes.py "drop_scratch_copies"
 marker web/studio.js "/solh3/sessions"

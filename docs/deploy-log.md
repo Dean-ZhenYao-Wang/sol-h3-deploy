@@ -79,3 +79,34 @@ git diff --relative=models/minimax_h3/Sol-H3-ComfyUI -- models/minimax_h3/Sol-H3
     `get_output_directory()`，还原后误报"标记仍在"。
 16. `git diff --relative=<dir>` 让补丁路径相对引擎目录，`patch -p1` 直接可用；
     新增文件要先 `git add -N`（intent-to-add）才会进 diff。
+
+## 2026-10-25 追加：条件冻结成产物 + 编码条件也存成产物
+
+### 两层冻结
+1. **素材字节**（上一轮做的）：每段把参考图/音频复制进 `request-NNNNN/refs/`，
+   继承读副本 → 关机重启、原始文件被删都不影响
+2. **编码后的潜变量**（这一轮）：ref2va 片段把 VAE 编码好的参考潜变量存成
+   `refs/conditioning.safetensors`，续接直接复用 → 即使 VAE 或编码代码换了，
+   这条链仍用当初那一版条件，不会"重新编码"而悄悄漂移
+
+### 实现要点
+- diffusers 的缝：`MiniMaxH3Ref2VAReferenceEncoderStep` 产出 `condition_latents`
+  （每个参考图一个 `(1,C,1,h,w)`）与 `audio_condition_latents`（每个带声参考一个
+  `(n*2,32)`）——钩在这个类的 `__call__` 上，有产物就注入、没有就照旧编码
+- **注意 `get_block_state` 不是共享对象**：它按每个 block 自己声明的输入重建一个
+  局部视图，编码步骤的产物要经**共享的 `PipelineState`** 取（`state.condition_latents`），
+  钩子里读 `block_state.condition_latents` 会拿到 None（踩过一次）
+- 注入时要同时设置 `condition_latents` 与 `audio_condition_latents` 再
+  `set_block_state`（该步骤的 intermediate_outputs 就这两个，少一个会抛）
+- 产物与素材的绑定用**内容摘要**（media digest），不含路径 → 同一份素材冻结到两段
+  不同目录里仍认得出是同一份条件
+
+### 验证
+- 单元测试 33 passed / 84 subtests（新增 ConditionArtifact 四例）
+- mock 注入：注入值与存储值逐位相同；参考数量对不上时如实回退并写明原因
+- 真机 E2E：ref2va 片段存下 `condition_00 (1,24,1,128,228)` + `audio_00 (414,32)`
+  （2.85MB）；继承续接 `reused` 命中父段产物；换参考那次 `artifact=null`（正确）
+- 父段与续接段产物**逐位相同**（identical: True）
+- 潜变量层面铁证：子段头部 12 行潜变量 = 父段尾部 12 行（逐位相同），音频 65 行同理
+  → 尾窗钉得死死的。MP4 帧差那个自造指标（15.33）是因为 MP4 是 121 帧而潜空间
+  覆盖 124 帧，比较时错位了 2–3 帧，不能当真

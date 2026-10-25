@@ -52,7 +52,7 @@ bash setup.sh --skip-weights --skip-build --skip-comfyui
 ### 引擎本体来自上游，扩展以补丁形式跟着仓库走
 
 引擎本体是上游 [NVlabs/Sana](https://github.com/NVlabs/Sana) 的 `models/minimax_h3/Sol-H3-ComfyUI`，
-本仓库对它的扩展（续接 Extend、参考素材原生插槽、保存目录/文件名、条件冻结成产物、
+本仓库对它的扩展（续接 Extend、参考素材原生插槽、保存目录/文件名、条件冻结成产物（素材字节 + 已编码的参考潜变量）、
 作品库对齐、Studio 续接来源选择器）以**补丁**形式放在 `setup/patches/`，
 由 `setup/apply-engine-patches.sh` 打到引擎目录上：
 
