@@ -110,3 +110,40 @@ git diff --relative=models/minimax_h3/Sol-H3-ComfyUI -- models/minimax_h3/Sol-H3
 - 潜变量层面铁证：子段头部 12 行潜变量 = 父段尾部 12 行（逐位相同），音频 65 行同理
   → 尾窗钉得死死的。MP4 帧差那个自造指标（15.33）是因为 MP4 是 121 帧而潜空间
   覆盖 124 帧，比较时错位了 2–3 帧，不能当真
+
+## 2026-10-25 追加：非续接模式不存条件产物
+
+### 用户要求
+「非续接的模式下，不要存这些产物」——普通生成（Text / First frame / Reference）不应落下
+冻结的参考副本 `refs/ref_01.png` / `refs/audio_01.wav`，也不应写 `refs/conditioning.safetensors`。
+这些产物只该在**链上（Extend）片段**产生，供下一次续接复用。
+
+### 实现
+`hyperflow_worker.py` 里用 `chain = bool(request.get("extend"))` 门控：
+- 链上 → `freeze_references(request_dir, images, audios)`：复制参考图/音频进 `request-NNNNN/refs/`，
+  并在 after_denoise 钩子里把编码后的参考潜变量存成 `conditioning.safetensors`
+- 非链 → `reference_records(images, audios)`：只把「来源路径 + 指纹」记进 session sidecar 的
+  `references` 字段，**不复制、不写编码产物**
+
+`condition_artifact.py` 的 `capture()` 同样被 `if _EXTEND.get("chain")` 包住，非链时不调用。
+
+### 顺手修掉的两个问题
+1. **worker 的 SyntaxError**：944–975 行的 generate/response 块缩进少了一层（12 而非 16），
+   导致 `try` 在 `except` 之前就结束、`py_compile` 报 "expected 'except' or 'finally' block"。
+   整段 +4 空格修复，`py_compile` 通过。
+2. **`condition_artifact.py` 的 4 处调试埋点**：`open("/root/hook_ca.log","a").write(...)` 全部移除
+   （HOOK path / injected / fallback / unreadable 四句），`grep -c hook_ca.log` 归零。
+
+### 验证
+- 单元测试 **23 passed**（GPU 无关）：含 `StandaloneTakeLeavesNoCopy`、`FreezingCopiesTheMediaIntoTheTake`、
+  `FrozenConditioning` 继承用例、`ConditionArtifact` 复用用例——确定性证明非链不落副本、链上冻结+继承均正确。
+- 全视频 `e2e_boundary.py`（standalone 不落产物 / 链上冻结 / 继承复用三步）因服务器显存
+  **VAE decode 阶段 OOM** 未跑完；该 OOM 与产物存储无关（冻结发生在成功渲染之后），可在显存充足环境补跑。
+- 补丁重生成（含 worker 缩进修复 + 条件产物无调试）：对干净上游 commit `41866cd` 打补丁后，
+  与实机引擎 `diff -rq` **逐文件一致（空）**。
+
+### 提交
+- 待 push：`setup/patches/0001-sol-h3-engine-extensions.patch`（重打）+ 引擎 4 个改动文件
+  （`comfy_nodes.py` / `extend.py` / `hyperflow_worker.py` / `tests/test_studio.py`）+ `docs/USAGE.md`
+  / `docs/deploy-log.md` 的非链说明。远端 `git@github.com:Dean-ZhenYao-Wang/sol-h3-deploy.git`，
+  push 在**服务器**上执行（服务器有 GitHub ed25519 密钥）。

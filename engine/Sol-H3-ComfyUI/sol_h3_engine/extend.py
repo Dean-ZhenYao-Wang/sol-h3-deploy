@@ -160,6 +160,22 @@ def file_digest(path):
         return ""
 
 
+def reference_records(images=(), audios=()):
+    """The reference files a take was conditioned on, as paths and digests.
+
+    No copies: this is what a take that is not part of a continuation records.
+    The chain freezes the media into its own directory when it needs it, and a
+    later take that inherits these references checks the digests before using
+    them -- a file that changed under the chain is refused by name.
+    """
+    records = []
+    for kind, paths in (("image", images), ("audio", audios)):
+        for path in paths:
+            records.append({"kind": kind, "path": str(path),
+                            "sha256": file_digest(str(path))})
+    return records
+
+
 def freeze_references(request_dir, images=(), audios=()):
     """Copy a take's reference media into the take's own directory.
 
@@ -169,6 +185,9 @@ def freeze_references(request_dir, images=(), audios=()):
     their digests, so a later take picks up the very same conditioning -- after a
     restart, after the source file was replaced, or after the input folder was
     cleared. The source path is kept only as provenance.
+
+    Only a take that continues a chain freezes its media: a standalone take
+    records where its references came from and leaves no copy behind.
 
     Returns the records that go into the session sidecar's metadata.
     """

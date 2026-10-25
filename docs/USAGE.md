@@ -96,9 +96,16 @@ ComfyUI 里有三个使用入口：
 - 继承时校验指纹：条件文件**被改过**或**不见了** → 直接报错拒绝，并指名道姓说是哪个文件
   （obvpm 的原则：*An artifact fails loudly; a recipe fails quietly* —— 条件悄悄变了，要等接缝不对劲才看得出来）
 
-条件不是"配方"，而是**随片段走的产物**：每条片段都把自己用的参考**冻结**进自己的目录
-（`output/sol_h3/<uuid>/request-NNNNN/refs/`），指纹与来源记在 session sidecar 的 metadata
-（`references` 字段）里。继承时读的是这份冻结副本，不是原始文件。
+条件不是"配方"，而是**随片段走的产物**：**只有「续接（Extend）」这一类的链上片段**会把参考
+**冻结**进自己的目录（`output/sol_h3/<uuid>/request-NNNNN/refs/`），指纹与来源记在 session sidecar
+的 metadata（`references` 字段）里。继承时读的是这份冻结副本，不是原始文件。
+
+> **非续接（standalone）的 Generate 不落这些产物**：普通生成（Text / First frame / Reference）只把
+> 参考的「来源路径 + 指纹」记进 sidecar，**不会**复制 `refs/ref_01.png` / `refs/audio_01.wav`，也**不会**
+> 写 `refs/conditioning.safetensors`。这些产物是给「链」用的——关机重启、原始文件丢失后照样能续、且不悄悄
+> 漂移——不是每条 take 都需要；留空既是少占空间，也避免无意义的字节副本。实现上由
+> `chain = bool(request.get("extend"))` 门控：链上走 `freeze_references()`（复制 + 编码条件产物），
+> 非链走 `reference_records()`（只记来源、不复制）。
 
 因此这条链：
 
@@ -108,8 +115,9 @@ ComfyUI 里有三个使用入口：
 
 ### 编码后的条件也存成产物（obvpm 的 `minimax_refs` 等价物）
 
-冻结的是**素材字节**，那还是"配方的一半"。每条 ref2va 片段还会把**已经编码好的参考潜变量**
-一起存下来——`request-NNNNN/refs/conditioning.safetensors`：
+冻结的是**素材字节**，那还是"配方的一半"。**链上（Extend）的** ref2va 片段还会把**已经编码好的参考潜变量**
+一起存下来——`request-NNNNN/refs/conditioning.safetensors`：**非续接的 Generate 不会写这个文件**，
+它只在链上片段随 `refs/` 介质副本一起产生，供下一次续接直接复用、且不因 VAE / 编码代码变动而漂移。
 
 | 张量 | 内容 |
 |---|---|
@@ -346,4 +354,4 @@ pkill -f "main.py"; sleep 3; bash /root/launch_comfy.sh
 8. **原生参考素材口**：comfy_nodes.py 的 `image_input`(IMAGE) / `audio_1…3`(AUDIO)——节点图可直接拉 `LoadImage` / `LoadAudio` 接线，节点内部落文件再交引擎
 9. **续接带参考素材（ref2va + 尾窗）**：hyperflow_worker.py 放开「续接只走文本条件」的护栏，有参考时走 ref2va（参考 DiT + 参考条件行），尾窗行仍钉在生成段头部；scheduler hook 的音频行偏移改为按生成行计（`(audio.shape[0] - nca) // 2`），否则带音频参考时 ch1 写入越界
 10. **参考继承与漂移防护（对齐 obvpm）**：每条片段把参考文件路径 + sha256 指纹写进 session sidecar 的 `references`；续接未提供参考时**继承父片段的参考**（obvpm 语义），继承前校验指纹，文件被改或消失则**指名报错拒绝**，不静默换素材
-11. **条件冻结成产物（obvpm 的 artifact 而非 recipe）**：`extend.py` 的 `freeze_references()`——引擎把这一段用的参考图/音频**复制进这一段自己的目录** `request-NNNNN/refs/`，指纹与来源写进 session metadata。继承读的是这份冻结副本，因此**关机重启、原始文件被覆盖或 `input/` 被清空，链条照样能续**；副本被动过或丢失则指名报错拒绝。节点侧 `comfy_nodes.py` 负责跑完后清掉 `input/solh3_refs/` 的临时物化副本
+11. **条件冻结成产物（obvpm 的 artifact 而非 recipe）**：`extend.py` 的 `freeze_references()`——**仅链上（Extend）片段**把这一段用的参考图/音频**复制进这一段自己的目录** `request-NNNNN/refs/`，指纹与来源写进 session metadata。继承读的是这份冻结副本，因此**关机重启、原始文件被覆盖或 `input/` 被清空，链条照样能续**；副本被动过或丢失则指名报错拒绝。**非续接的 Generate 只记来源、不复制**（`reference_records()`），不产生 `refs/` 下的任何产物。节点侧 `comfy_nodes.py` 负责跑完后清掉 `input/solh3_refs/` 的临时物化副本

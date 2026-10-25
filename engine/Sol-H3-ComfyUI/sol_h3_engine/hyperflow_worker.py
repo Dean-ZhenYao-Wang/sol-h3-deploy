@@ -162,7 +162,7 @@ def _concat_planar(chunks):
 # one request at a time, so a module-level slot is enough. "window" is the
 # context built by extend.build_extend(); "session_target"/"session_meta" make
 # every take write its latents sidecar for the next extend in the chain.
-_EXTEND = {"window": None, "session_target": None, "session_meta": None}
+_EXTEND = {"window": None, "session_target": None, "session_meta": None, "chain": False}
 
 try:  # package import under ComfyUI, flat import in the worker process
     from . import extend as _extend
@@ -361,16 +361,19 @@ def install_extend_patches():
                 meta.setdefault("delivered_frames", meta["raw_frames"])
             # The reference latents this take was built on, stored as an artifact
             # beside the take: the next take in the chain continues on exactly
-            # these, not on a re-encoding of the same media.
-            media = ""
-            try:
-                frozen = json.loads(meta.get("references") or "[]")
-                media = _artifact.media_digest([r.get("path") for r in frozen if r.get("path")])
-            except Exception:
+            # these, not on a re-encoding of the same media. Only a take that is
+            # part of a chain keeps one.
+            record = None
+            if _EXTEND.get("chain"):
                 media = ""
-            record = _artifact.capture(state, meta.get("task"), Path(target).parent, media)
-            if record:
-                meta["condition_artifact"] = json.dumps(record)
+                try:
+                    frozen = json.loads(meta.get("references") or "[]")
+                    media = _artifact.media_digest([r.get("path") for r in frozen if r.get("path")])
+                except Exception:
+                    media = ""
+                record = _artifact.capture(state, meta.get("task"), Path(target).parent, media)
+                if record:
+                    meta["condition_artifact"] = json.dumps(record)
             written = _extend.write_session(target, block_state.latents,
                                             block_state.audio_latents, meta)
             if window is not None:
@@ -883,19 +886,27 @@ def serve(options, write_json):
                 # chain has a source; an `extend` request additionally pins one.
                 if options["hyperflow"].get("session_sidecar", True):
                     _EXTEND["session_target"] = str(_extend.session_path_for(request_dir))
-                    # The take's conditioning, frozen into its own directory: a later
-                    # take inherits this exact copy instead of rebuilding it from the
-                    # source, so a chain survives a restart, a replaced input file or
-                    # a cleared input folder (obvpm's artifact-over-recipe rule).
-                    frozen = _extend.freeze_references(request_dir, request.get("images") or [],
-                                                        request.get("audios") or [])
+                    # A take that continues a chain freezes its reference media into
+                    # its own directory and stores the encoded conditioning with it;
+                    # a standalone take only records where its references came from
+                    # and leaves no copy behind. The artifacts are for the chain,
+                    # not for every take.
+                    chain = bool(request.get("extend"))
+                    _EXTEND["chain"] = chain
+                    images = [str(p) for p in (request.get("images") or [])]
+                    audios = [str(p) for p in (request.get("audios") or [])]
+                    if chain:
+                        records = _extend.freeze_references(request_dir, images, audios)
+                    else:
+                        records = _extend.reference_records(images, audios)
                     _EXTEND["session_meta"] = {
                         "self_id": case["case_id"], "prompt": case["prompt"],
                         "seed": str(case["seed"]), "profile": options["name"],
                         "resolution": str(request.get("resolution", "768p")),
                         "task": payload.get("task", case["task"]), "source_path": "",
-                        # The frozen copies this take was conditioned on.
-                        "references": json.dumps(frozen),
+                        # What this take was conditioned on: the frozen copies when it
+                        # is part of a chain, the source files otherwise.
+                        "references": json.dumps(records),
                     }
                 extend_request = request.get("extend")
                 if extend_request:
@@ -947,21 +958,21 @@ def serve(options, write_json):
                         "parent_id": window["parent_id"],
                         "session": window.get("session_written"),
                     }
-                write_json(request["response"], {
-                    "status": "PASS", "case_id": case["case_id"], "seed": case["seed"],
-                    "task": case["task"], "output": row["output"], "e2e_s": e2e,
-                    "delivered_output": row.get("delivered_output"),
-                    "qwen_s": qwen_s, "qwen_encode_s": qwen_call_s if not request.get("conditioning") else 0.0,
-                    "h3_phases_s": {"generate_s": row["generate_s"], **row.get("phases_s", {})},
-                    "forwards": row["forwards"], "adaln_variant": row.get("adaln_variant"),
-                    "session": (_EXTEND.get("session_target") if window is None
-                                else window.get("session_written")),
-                    "extend": extend_report,
-                    "condition_artifact": _artifact.current_state(),
-                    "profile": options["name"], "precision": "hyperflow",
-                    "decoder": "original", "single_stage": True, "cold_start": cold,
-                    "startup_and_warmup_s": engine.load_s if cold else 0, "prompt": case["prompt"],
-                    "timing": "request through completed MP4; model load reported separately"})
+                    write_json(request["response"], {
+                        "status": "PASS", "case_id": case["case_id"], "seed": case["seed"],
+                        "task": case["task"], "output": row["output"], "e2e_s": e2e,
+                        "delivered_output": row.get("delivered_output"),
+                        "qwen_s": qwen_s, "qwen_encode_s": qwen_call_s if not request.get("conditioning") else 0.0,
+                        "h3_phases_s": {"generate_s": row["generate_s"], **row.get("phases_s", {})},
+                        "forwards": row["forwards"], "adaln_variant": row.get("adaln_variant"),
+                        "session": (_EXTEND.get("session_target") if window is None
+                                    else window.get("session_written")),
+                        "extend": extend_report,
+                        "condition_artifact": _artifact.current_state(),
+                        "profile": options["name"], "precision": "hyperflow",
+                        "decoder": "original", "single_stage": True, "cold_start": cold,
+                        "startup_and_warmup_s": engine.load_s if cold else 0, "prompt": case["prompt"],
+                        "timing": "request through completed MP4; model load reported separately"})
             except Exception as error:
                 write_json(request["response"], {"status": "FAIL",
                                                  "error": "%s: %s" % (type(error).__name__, error)})
@@ -971,6 +982,7 @@ def serve(options, write_json):
                 _EXTEND["session_target"] = None
                 _EXTEND["session_meta"] = None
                 _EXTEND["adaln_key"] = None
+                _EXTEND["chain"] = False
                 _artifact.set_current(None)
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

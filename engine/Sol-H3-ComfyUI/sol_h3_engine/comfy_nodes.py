@@ -191,14 +191,14 @@ def read_session_references(session_path):
 
 
 def inherited_references(session_path):
-    """The parent take's stored conditioning: the copies it froze for itself.
+    """The references the parent take was conditioned on, verified against their digests.
 
     obvpm's model: a chain inherits the conditioning of the take it continues,
-    and that conditioning is an artifact, not a recipe. The take froze its
-    reference media into its own directory, so a later take picks up the very
-    same files -- after a restart, after the source file moved on, after the
-    input folder was cleared. A missing artifact is refused by name: a chain
-    never silently rebuilds its conditioning.
+    and that conditioning is an artifact, not a recipe. A take that is part of
+    a chain froze its reference media into its own directory; a standalone take
+    only recorded where its references came from. Either way the digests are
+    checked first: a file that changed under the chain is refused by name
+    rather than quietly swapped for a new one.
     """
     images, audios = [], []
     for record in read_session_references(session_path):
@@ -206,15 +206,15 @@ def inherited_references(session_path):
         kind = str(record.get("kind") or "image")
         if not path or not os.path.isfile(path):
             raise ValueError(
-                "The take this extends stored its conditioning at %s, and that file is gone. "
-                "A chain never rebuilds its conditioning silently: restore the file, or "
-                "attach the reference again to continue with a new one."
+                "The take this extends was conditioned on %s, and that file is gone. "
+                "A chain never rebuilds its conditioning silently: attach the reference "
+                "again to continue with a new one."
                 % (path or "an unnamed file"))
         expected = str(record.get("sha256") or "")
         digest = _extend.file_digest(path)
         if expected and digest != expected:
             raise ValueError(
-                "The take this extends stored its conditioning at %s, and that file has "
+                "The take this extends was conditioned on %s, and that file has "
                 "changed since (digest %s, was %s). Restore it, or attach the reference "
                 "again to continue with a new one."
                 % (path, digest[:12], expected[:12]))

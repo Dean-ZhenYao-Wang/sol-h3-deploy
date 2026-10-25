@@ -359,6 +359,37 @@ def torch_zeros(shape=(1, 24, 1, 4, 4)):
 
 
 
+class StandaloneTakeLeavesNoCopy(unittest.TestCase):
+    """A take that is not part of a chain records its references, copies nothing."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.source = self.root / "ref.png"
+        self.source.write_bytes(b"pixels")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_reference_records_point_at_the_source_without_copying(self):
+        records = engine_extend.reference_records([str(self.source)], [])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["path"], str(self.source))
+        self.assertEqual(records[0]["kind"], "image")
+        self.assertEqual(records[0]["sha256"], engine_extend.file_digest(str(self.source)))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["ref.png"])
+
+    def test_freezing_copies_the_media_into_the_take(self):
+        take = self.root / "request-00001"
+        records = engine_extend.freeze_references(take, [str(self.source)], [])
+        self.assertNotEqual(records[0]["path"], str(self.source))
+        self.assertEqual(Path(records[0]["path"]).read_bytes(), self.source.read_bytes())
+        self.assertEqual(records[0]["source"], str(self.source))
+        # The copy has the same content, so the media digest is the same one.
+        self.assertEqual(engine_artifact.media_digest([str(self.source)]),
+                         engine_artifact.media_digest([records[0]["path"]]))
+
+
 class ConditionArtifact(unittest.TestCase):
     """The encoded conditioning, stored and loaded as an artifact."""
 
